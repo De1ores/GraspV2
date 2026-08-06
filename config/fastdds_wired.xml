@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>graspv2_wired_udp</transport_id>
+      <type>UDPv4</type>
+      <interfaceWhiteList>
+        <address>10.0.200.2</address>
+      </interfaceWhiteList>
+    </transport_descriptor>
+  </transport_descriptors>
+  <participant profile_name="graspv2_wired" is_default_profile="true">
+    <rtps>
+      <useBuiltinTransports>false</useBuiltinTransports>
+      <userTransports>
+        <transport_id>graspv2_wired_udp</transport_id>
+      </userTransports>
+    </rtps>
+  </participant>
+</profiles>

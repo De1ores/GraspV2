@@ -1,0 +1,6 @@
+RequestHeader header
+McMotion motion
+bool interrupt
+uint64 play_timestamp
+---
+CommonResponse response

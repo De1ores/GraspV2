@@ -1,0 +1,22 @@
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+/.venv/
+
+# ROS 2 / colcon build products
+/build/
+/install/
+/log/
+/aimdk09_build/
+/aimdk09_install/
+/aimdk09_log/
+/aimdk0907_build/
+/aimdk0907_install/
+/aimdk0907_log/
+
+# Regenerated vision output
+/output/

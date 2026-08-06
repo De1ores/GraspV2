@@ -1,0 +1,2 @@
+string tag
+McMotionType type

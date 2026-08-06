@@ -1,0 +1,5 @@
+RequestHeader header
+string source
+McActionCommand command
+---
+CommonResponse response

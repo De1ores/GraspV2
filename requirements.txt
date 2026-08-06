@@ -1,0 +1,5 @@
+# Runtime dependencies for the single ./run.sh entry point.
+# Use a regular local install for compatibility with Jetson/Orin's older pip.
+./x2_ik_sdk
+mujoco>=3.3,<4
+numpy>=1.24

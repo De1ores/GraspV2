@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "grasp_point_mujoco_m": [0.3666481438, -0.3553605768, 0.9072504747],
+  "selected_detection": {
+    "class_name": "bottle",
+    "confidence": 0.95
+  },
+  "table_plane_mujoco": {
+    "plane_equation": {
+      "form": "normal dot [x,y,z] + d = 0",
+      "normal_mujoco": [0.0, 0.0, 1.0],
+      "d_m": -0.8
+    },
+    "mujoco_collision_box": {
+      "type": "box",
+      "pos_mujoco_m": [0.55, -0.25, 0.78],
+      "quat_wxyz": [1.0, 0.0, 0.0, 0.0],
+      "size_half_extents_m": [0.3, 0.35, 0.02]
+    }
+  }
+}

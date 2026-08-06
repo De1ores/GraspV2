@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>aimdk_msgs</name>
+  <version>0.9.0</version>
+  <description>X2 v0.9.0.7 MC, upper-body and OmniPicker interfaces used by graspV2.</description>
+  <maintainer email="ruiujia@example.com">ruiujia</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <build_depend>rosidl_default_generators</build_depend>
+  <depend>builtin_interfaces</depend>
+  <exec_depend>rosidl_default_runtime</exec_depend>
+
+  <member_of_group>rosidl_interface_packages</member_of_group>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

@@ -1,0 +1,4 @@
+RequestHeader header
+---
+CommonTaskResponse response
+McMotion[] motion
