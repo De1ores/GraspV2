@@ -7,7 +7,9 @@ from types import SimpleNamespace
 import pytest
 
 from graspv2.aimdk_hardware import (
+    _largest_tracking_error,
     _load_ros_types,
+    _wait_for_control_services,
     build_joint_message,
     build_omnipicker_message,
     build_upper_body_message,
@@ -19,6 +21,7 @@ from graspv2.hardware_contract import (
     UpperBodyFrame,
     arm_setpoints,
     load_hardware_config,
+    require_installed_omnipicker_side,
     resolve_joint_feedback,
     upper_body_arm_positions,
 )
@@ -33,14 +36,25 @@ def _joint(name: str, position: float):
 
 def test_default_config_uses_x2_aimdk_topics() -> None:
     config = load_hardware_config()
+    assert config.schema_version == 2
     assert config.topics.arm_command == "/aima/hal/joint/arm/command"
     assert config.topics.hand_state == "/aima/hal/joint/hand/state"
     assert config.topics.upper_body_command == "/mc/upper_body_command"
     assert config.services.set_mc_action.endswith("/SetMcAction")
-    assert config.omnipicker.left_joint_name == "left_claw_joint"
+    assert config.services.get_current_input_source.endswith(
+        "/GetCurrentInputSource"
+    )
+    assert config.services.set_mc_input_source.endswith("/SetMcInputSource")
+    assert config.upper_body.command_source == "graspv2"
+    assert config.upper_body.command_source_priority == 65
+    assert config.upper_body.service_discovery_timeout_s == 15.0
+    assert config.omnipicker.installed_side == "right"
     assert config.omnipicker.require_feedback is False
     assert config.topics.rgb_image.endswith("/rgbd_head_front/rgb_image")
     assert config.topics.depth_camera_info.endswith("/depth_camera_info")
+    require_installed_omnipicker_side(config, "right")
+    with pytest.raises(HardwareContractError, match="installed only on right"):
+        require_installed_omnipicker_side(config, "left")
 
 
 def test_feedback_accepts_documented_order_or_complete_names() -> None:
@@ -56,7 +70,7 @@ def test_feedback_accepts_documented_order_or_complete_names() -> None:
 
 
 def test_arm_setpoints_overlay_active_side_and_hold_other_side() -> None:
-    profile = PROFILES["youth"]
+    profile = PROFILES["ultra"]
     base = [0.1 * index for index in range(profile.arm_dof * 2)]
     active = {name: 0.25 for name in profile.right_arm_joints}
     velocities = {name: -0.05 for name in profile.right_arm_joints}
@@ -77,41 +91,55 @@ def test_arm_setpoints_overlay_active_side_and_hold_other_side() -> None:
     )
 
 
-def test_upper_body_layout_expands_youth_missing_wrists() -> None:
-    profile = PROFILES["youth"]
-    expanded = upper_body_arm_positions(profile, tuple(range(10)))
-    assert expanded == (
-        0.0,
-        1.0,
-        2.0,
-        3.0,
-        4.0,
-        0.0,
-        0.0,
-        5.0,
-        6.0,
-        7.0,
-        8.0,
-        9.0,
-        0.0,
-        0.0,
+def test_upper_body_layout_preserves_ultra_joint_order() -> None:
+    profile = PROFILES["ultra"]
+    positions = tuple(range(14))
+    assert upper_body_arm_positions(profile, positions) == pytest.approx(positions)
+
+
+def test_omnipicker_builder_commands_only_the_installed_right_side() -> None:
+    class HandType:
+        def __init__(self, *, value: int):
+            self.value = value
+
+    class HandCommand:
+        pass
+
+    class HandCommandArray:
+        def __init__(self):
+            self.left_hands = []
+            self.right_hands = []
+
+    types = SimpleNamespace(
+        HandType=HandType,
+        HandCommand=HandCommand,
+        HandCommandArray=HandCommandArray,
     )
+    config = load_hardware_config()
+    message = build_omnipicker_message(types, config, "right", 0.0)
+    assert message.left_hand_type.value == 0
+    assert message.left_hands == []
+    assert message.right_hand_type.value == 2
+    assert len(message.right_hands) == 1
+    assert message.right_hands[0].name == "right_claw_joint"
+    with pytest.raises(HardwareContractError, match="installed only on right"):
+        build_omnipicker_message(types, config, "left", 0.0)
 
 
 def test_ros_builders_match_installed_aimdk_contract() -> None:
     types = _load_ros_types()
     require_aimdk_control_schema(types)
     config = load_hardware_config()
-    profile = PROFILES["youth"]
+    profile = PROFILES["ultra"]
     commands = arm_setpoints(
         profile,
-        [0.0] * 10,
+        [0.0] * 14,
         {profile.left_arm_joints[0]: 0.2},
         {profile.left_arm_joints[0]: 0.1},
         config.upper_body,
     )
     joint_message = build_joint_message(types, commands)
-    assert len(joint_message.joints) == 10
+    assert len(joint_message.joints) == 14
     assert joint_message.joints[0].stiffness == 20.0
 
     hand_message = build_omnipicker_message(types, config, "right", 0.0)
@@ -134,10 +162,27 @@ def test_ros_builders_match_installed_aimdk_contract() -> None:
         sequence=7,
     )
     assert upper_message.header.sequence == 7
-    assert upper_message.source == "remote_teleop_pc"
+    assert upper_message.source == "graspv2"
     assert len(upper_message.arm_pos) == 14
     assert upper_message.hand_sub_mode == 1
     assert list(upper_message.hand_pos) == [1.0, 0.0]
+
+
+def test_largest_tracking_error_reports_joint_and_values() -> None:
+    feedback = (0.0, -0.01, 0.20)
+    index_by_name = {"shoulder": 0, "elbow": 1, "wrist": 2}
+    targets = {"shoulder": -0.355, "elbow": 0.02}
+
+    error, name, actual, target = _largest_tracking_error(
+        feedback,
+        index_by_name,
+        targets,
+    )
+
+    assert error == pytest.approx(0.355)
+    assert name == "shoulder"
+    assert actual == pytest.approx(0.0)
+    assert target == pytest.approx(-0.355)
 
 
 def test_competition_hand_publisher_uses_reference_qos() -> None:
@@ -192,6 +237,28 @@ def test_competition_hand_publisher_uses_reference_qos() -> None:
     )
 
 
+def test_each_control_service_gets_a_full_discovery_timeout() -> None:
+    class FakeClient:
+        def __init__(self):
+            self.timeouts = []
+
+        def wait_for_service(self, *, timeout_sec):
+            self.timeouts.append(timeout_sec)
+            return True
+
+    config = load_hardware_config()
+    clients = [FakeClient() for _ in range(4)]
+
+    _wait_for_control_services(
+        tuple((client, f"/service/{index}") for index, client in enumerate(clients)),
+        config.upper_body.service_discovery_timeout_s,
+    )
+
+    assert [client.timeouts for client in clients] == [
+        [config.upper_body.service_discovery_timeout_s]
+    ] * 4
+
+
 def test_visual_grasp_sequence_orders_hand_vision_lift_and_recovery() -> None:
     class FakeQoS:
         def __init__(self, **values):
@@ -224,7 +291,7 @@ def test_visual_grasp_sequence_orders_hand_vision_lift_and_recovery() -> None:
     original = _load_ros_types()
     types = replace(original, Node=FakeNode, QoSProfile=FakeQoS)
     node = create_aimdk_hardware_node(types, load_hardware_config())
-    profile = PROFILES["youth"]
+    profile = PROFILES["ultra"]
     names = profile.right_arm_joints
     approach = JointTrajectory(
         source=Path("approach.json"),
@@ -241,7 +308,7 @@ def test_visual_grasp_sequence_orders_hand_vision_lift_and_recovery() -> None:
         maximum_velocity=0.05,
     )
     metadata = GraspPlanMetadata(
-        robot_profile="youth",
+        robot_profile="ultra",
         side="right",
         grasp_target_world_m=(0.4, -0.2, 0.8),
         lifted_target_world_m=(0.4, -0.2, 0.9),
@@ -252,14 +319,18 @@ def test_visual_grasp_sequence_orders_hand_vision_lift_and_recovery() -> None:
     events = []
     node._wait_for_mode_services = lambda: events.append("mode-services")
     node._wait_for_command_consumer = lambda group: events.append(f"consumer:{group}")
-    node._assert_arm_health = lambda *_args, **_kwargs: (0.0,) * 10
+    node._assert_arm_health = lambda *_args, **_kwargs: (0.0,) * 14
     node._assert_head_health = lambda: (0.0, 0.0)
     node._validate_upper_body_start = lambda *_args: None
     node._require_stable_mode = lambda: events.append("stable")
+    node.configure_input_source = lambda: events.append("configure-source")
     node.execute_omnipicker = lambda side, position: events.append(
         f"preopen:{side}:{position:.1f}"
     )
     node._enter_split_mode = lambda: events.append("enter-split")
+    node._activate_input_source = (
+        lambda *_args: events.append("activate-source")
+    )
     node.restore_stable_mode = lambda: events.append("restore-stable")
 
     def run_segment(_profile, _trajectory, _base, _head, *, label):
@@ -301,9 +372,11 @@ def test_visual_grasp_sequence_orders_hand_vision_lift_and_recovery() -> None:
         "mode-services",
         "consumer:hand",
         "stable",
+        "configure-source",
         "preopen:right:1.0",
         "enter-split",
         "consumer:upper-body",
+        "activate-source",
         "trajectory:approach",
         "hand:right:0.0",
         "vision:closed-grasp:45",

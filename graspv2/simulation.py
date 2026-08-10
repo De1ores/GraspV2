@@ -2,8 +2,9 @@
 
 The official SDK URDF remains the kinematic source of truth.  When the physical
 X2 URDF is available, its full-body visual meshes are attached to the matching
-SDK link frames.  Conservative primitive proxies cover the arm, while the real
-OmniPicker meshes provide both the visible hand and its collision geometry.
+SDK link frames. Conservative primitive proxies cover the arm, while the
+right-hand OmniPicker meshes provide both the visible gripper and its collision
+geometry.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ import mujoco
 import numpy as np
 
 from .official_ik import OfficialIK
-from .robot_profiles import RobotProfile
+from .robot_profiles import INSTALLED_GRIPPER_SIDE, RobotProfile
 from .tool_pose import ToolPoseConfig
 
 
@@ -35,10 +36,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OMNIPICKER_DESCRIPTION = (
     PROJECT_ROOT / "robot_description" / "urdf" / "robot_urdf.xacro"
 )
-OMNIPICKER_REPLACED_VISUAL_LINKS = (
-    "left_wrist_roll_link",
-    "right_wrist_roll_link",
-)
+OMNIPICKER_REPLACED_VISUAL_LINKS = {
+    "left": ("left_wrist_roll_link",),
+    "right": ("right_wrist_roll_link",),
+}[INSTALLED_GRIPPER_SIDE]
 
 
 def _numbers(text: str | None, length: int, default: tuple[float, ...]) -> tuple[float, ...]:
@@ -288,15 +289,27 @@ def resolve_robot_visual_urdf(path: Path | None = None) -> Path | None:
     for candidate in candidates:
         source = candidate.expanduser().resolve()
         if source.is_file():
-            # Parse now so an explicit bad XML fails at the boundary with context.
+            # Validate both XML and every referenced visual mesh before choosing
+            # an automatically discovered installation. Some field images ship
+            # x2_whole_body.urdf without its sibling meshes; that installation
+            # must fall back to collision proxies instead of breaking planning.
             try:
                 root = ET.parse(source).getroot()
-            except (OSError, ET.ParseError) as error:
-                raise ValueError(f"cannot parse robot visual URDF {source}: {error}") from error
-            if root.tag != "robot":
-                raise ValueError(f"robot visual URDF root must be <robot>: {source}")
-            if not root.findall(".//visual/geometry/mesh"):
-                raise ValueError(f"robot visual URDF has no visual meshes: {source}")
+                if root.tag != "robot":
+                    raise ValueError(
+                        f"robot visual URDF root must be <robot>: {source}"
+                    )
+                if not root.findall(".//visual/geometry/mesh"):
+                    raise ValueError(
+                        f"robot visual URDF has no visual meshes: {source}"
+                    )
+                _read_urdf_visuals(source)
+            except (OSError, ET.ParseError, ValueError) as error:
+                if explicit:
+                    raise ValueError(
+                        f"invalid robot visual URDF {source}: {error}"
+                    ) from error
+                continue
             return source
     if explicit:
         raise ValueError(f"robot visual URDF does not exist: {candidates[0]}")
@@ -435,14 +448,14 @@ def _read_urdf_visuals(
 def _read_omnipicker_visuals(path: Path) -> dict[str, tuple[_UrdfVisual, ...]]:
     source = _read_urdf_visuals(path, minimum_meshed_links=9)
     result: dict[str, tuple[_UrdfVisual, ...]] = {}
+    prefix = "L" if INSTALLED_GRIPPER_SIDE == "left" else "R"
     for link_name, visuals in source.items():
-        for prefix in ("L", "R"):
-            target = (
-                f"{prefix}_omnipicker_base_link"
-                if link_name == "base_link"
-                else f"{prefix}_{link_name}"
-            )
-            result[target] = visuals
+        target = (
+            f"{prefix}_omnipicker_base_link"
+            if link_name == "base_link"
+            else f"{prefix}_{link_name}"
+        )
+        result[target] = visuals
     return result
 
 
@@ -742,15 +755,7 @@ def _build_mjcf(
                 pos=_format(joint.xyz),
                 quat=_format(joint.quaternion),
             )
-            if joint.name in active or (
-                profile.arm_dof == 5
-                and joint.name in (
-                    "left_wrist_pitch_joint",
-                    "left_wrist_roll_joint",
-                    "right_wrist_pitch_joint",
-                    "right_wrist_roll_joint",
-                )
-            ):
+            if joint.name in active:
                 ET.SubElement(
                     body,
                     "joint",
@@ -932,22 +937,6 @@ class RobotSimulation:
             if joint_id < 0:
                 raise RuntimeError(f"simulation joint is missing: {name}")
             self.qpos_indices[name] = int(self.model.jnt_qposadr[joint_id])
-        self.locked_qpos: dict[int, float] = {}
-        if profile.arm_dof == 5:
-            sdk_q = ik.solver.q_from_arm_pos(ik.ready_arm_pos())
-            for name in (
-                "left_wrist_pitch_joint",
-                "left_wrist_roll_joint",
-                "right_wrist_pitch_joint",
-                "right_wrist_roll_joint",
-            ):
-                simulation_joint = mujoco.mj_name2id(
-                    self.model, mujoco.mjtObj.mjOBJ_JOINT, name
-                )
-                sdk_joint = ik.solver.model.getJointId(name)
-                self.locked_qpos[int(self.model.jnt_qposadr[simulation_joint])] = float(
-                    sdk_q[ik.solver.model.idx_qs[sdk_joint]]
-                )
         self.site_ids = {
             "left": mujoco.mj_name2id(
                 self.model, mujoco.mjtObj.mjOBJ_SITE, LEFT_SITE_NAME
@@ -972,8 +961,6 @@ class RobotSimulation:
             )
         for name, value in zip(self.profile.arm_pos_order, values):
             self.data.qpos[self.qpos_indices[name]] = value
-        for index, value in self.locked_qpos.items():
-            self.data.qpos[index] = value
         mujoco.mj_forward(self.model, self.data)
 
     def set_side_joints(

@@ -1,7 +1,0 @@
-RequestHeader header
-McControlArea area
-McPresetMotion motion
-bool interrupt
-string ani_path
----
-CommonTaskResponse response

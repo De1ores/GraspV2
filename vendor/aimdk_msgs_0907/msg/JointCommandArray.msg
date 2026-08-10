@@ -1,2 +1,0 @@
-MessageHeader header
-JointCommand[] joints

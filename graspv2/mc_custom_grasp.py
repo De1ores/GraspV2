@@ -1,4 +1,4 @@
-"""Execute a grasp CSV through the X2 v0.9 MC animation player."""
+"""Execute a grasp CSV through the compatible X2 MC animation player."""
 
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ from .mc_animation import (
     DEFAULT_ARM_POSITION,
     validate_mc_animation_csv,
 )
+from .ros_logging import configure_fastdds_logging
 from .trajectory import ARM_JOINT_ORDER
 
 
@@ -55,37 +56,32 @@ class SafetyError(RuntimeError):
     """Raised when live state is unsuitable for an MC-owned animation."""
 
 
-def _require_sdk0907_layout() -> None:
+def _require_compatible_sdk_layout() -> None:
     joint_fields = set(JointState.get_fields_and_field_types())
-    expected_joint_fields = {
-        "name",
-        "position",
-        "velocity",
-        "effort",
-        "coil_temp",
-        "motor_temp",
-        "motor_vol",
-    }
-    if joint_fields != expected_joint_fields:
+    base_joint_fields = {"name", "position", "velocity", "effort"}
+    allowed_joint_fields = (
+        base_joint_fields | {"coil_temp", "motor_temp", "motor_vol"},
+        base_joint_fields | {"error_code"},
+    )
+    if joint_fields not in allowed_joint_fields:
         raise RuntimeError(
-            "wrong aimdk_msgs overlay: JointState does not match the "
-            "robot's v0.9.0.7 temperature layout"
+            "wrong aimdk_msgs overlay: JointState does not match a supported "
+            "temperature/error-code layout"
         )
 
-    expected_requests = (
-        (
-            SetMcPresetMotion.Request,
-            {"header", "area", "motion", "interrupt", "ani_path"},
-        ),
+    request_fields = set(
+        SetMcPresetMotion.Request.get_fields_and_field_types()
     )
-    for request_type, expected_fields in expected_requests:
-        actual = set(request_type.get_fields_and_field_types())
-        if actual != expected_fields:
-            raise RuntimeError(
-                "wrong aimdk_msgs overlay: "
-                f"{request_type.__name__} fields are {sorted(actual)}, "
-                f"expected {sorted(expected_fields)}"
-            )
+    base_request_fields = {"header", "area", "motion", "interrupt", "ani_path"}
+    if request_fields not in (
+        base_request_fields,
+        base_request_fields | {"play_timestamp"},
+    ):
+        raise RuntimeError(
+            "wrong aimdk_msgs overlay: SetMcPresetMotion_Request fields are "
+            f"{sorted(request_fields)}; expected ani_path layout with optional "
+            "play_timestamp"
+        )
 
 
 class McCustomGraspClient(Node):
@@ -142,9 +138,9 @@ class McCustomGraspClient(Node):
                 f"state={self.arm_state.state.value}"
             )
         joints = list(self.arm_state.joints)
-        if len(joints) not in (10, 14):
+        if len(joints) != 14:
             raise SafetyError(
-                "expected a 10/14-joint arm state, received "
+                "expected an Ultra 14-joint arm state, received "
                 f"{len(joints)} joints"
             )
         if (
@@ -164,15 +160,31 @@ class McCustomGraspClient(Node):
                 "arm state is missing core joints: " + ", ".join(missing)
             )
 
-        hottest = max(
-            max(int(joint.coil_temp), int(joint.motor_temp))
+        hottest: int | None = None
+        if all(
+            hasattr(joint, "coil_temp") and hasattr(joint, "motor_temp")
             for joint in joints
-        )
-        if hottest >= self.args.max_temperature:
-            raise SafetyError(
-                f"arm temperature {hottest} C reached the configured "
-                f"{self.args.max_temperature} C threshold"
+        ):
+            hottest = max(
+                max(int(joint.coil_temp), int(joint.motor_temp))
+                for joint in joints
             )
+            if hottest >= self.args.max_temperature:
+                raise SafetyError(
+                    f"arm temperature {hottest} C reached the configured "
+                    f"{self.args.max_temperature} C threshold"
+                )
+        else:
+            failed_joints = [
+                joint.name
+                for joint in joints
+                if int(getattr(joint, "error_code", 0)) != 0
+            ]
+            if failed_joints:
+                raise SafetyError(
+                    "arm joints report non-zero error_code: "
+                    + ", ".join(failed_joints)
+                )
         fastest = max(abs(float(joint.velocity)) for joint in joints)
         if fastest > self.args.max_start_velocity:
             raise SafetyError(
@@ -192,9 +204,14 @@ class McCustomGraspClient(Node):
                 f"{position_error:.3f} rad, limit is "
                 f"{self.args.max_start_error:.3f} rad"
             )
+        health = (
+            f"hottest={hottest} C"
+            if hottest is not None
+            else "per-joint error_code=0"
+        )
         self.get_logger().info(
-            "Compatible v0.9 arm state: "
-            f"{len(joints)} joints, hottest={hottest} C, "
+            "Compatible AimDK arm state: "
+            f"{len(joints)} joints, {health}, "
             f"max_velocity={fastest:.3f} rad/s, "
             f"start_error={position_error:.3f} rad"
         )
@@ -308,6 +325,8 @@ class McCustomGraspClient(Node):
         # queue according to its own policy; this client does not force it.
         request.interrupt = False
         request.ani_path = self.args.robot_animation_path
+        if hasattr(request, "play_timestamp"):
+            request.play_timestamp = 0
         response = self._call_mutating_once(
             self.preset_motion_client,
             request,
@@ -467,8 +486,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--expected-arm-dof",
         type=int,
-        choices=(10, 14),
-        help="require the live robot to match the selected youth/ultra profile",
+        choices=(14,),
+        default=14,
+        help="require the live robot to expose the Ultra 14-joint arm state",
     )
     parser.add_argument("--max-temperature", type=int, default=80)
     parser.add_argument("--max-start-velocity", type=float, default=0.15)
@@ -571,7 +591,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     node: McCustomGraspClient | None = None
     try:
-        _require_sdk0907_layout()
+        _require_compatible_sdk_layout()
+        configure_fastdds_logging()
         rclpy.init(args=[])
         node = McCustomGraspClient(args)
         if args.preflight:

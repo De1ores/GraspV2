@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "aimdk_api": "v0.9.0.7/v1.0 topic-compatible",
   "topics": {
     "arm_command": "/aima/hal/joint/arm/command",
@@ -18,7 +18,9 @@
   },
   "services": {
     "get_mc_action": "/aimdk_5Fmsgs/srv/GetMcAction",
-    "set_mc_action": "/aimdk_5Fmsgs/srv/SetMcAction"
+    "set_mc_action": "/aimdk_5Fmsgs/srv/SetMcAction",
+    "get_current_input_source": "/aimdk_5Fmsgs/srv/GetCurrentInputSource",
+    "set_mc_input_source": "/aimdk_5Fmsgs/srv/SetMcInputSource"
   },
   "upper_body": {
     "command_rate_hz": 50.0,
@@ -35,17 +37,20 @@
     "maximum_tracking_error_rad": 0.35,
     "maximum_temperature_c": 80,
     "final_hold_s": 0.30,
+    "service_discovery_timeout_s": 15.0,
     "service_timeout_s": 0.50,
     "service_retries": 8,
     "mode_timeout_s": 5.0,
     "running_mode_status": 100,
     "stable_mode": "STAND_DEFAULT",
     "split_mode": "UPPERBODY_REMOTE_SPLIT",
-    "command_source": "remote_teleop_pc",
+    "command_source": "graspv2",
+    "command_source_priority": 65,
+    "command_source_timeout_ms": 1000,
     "mode_source": "rc"
   },
   "omnipicker": {
-    "left_joint_name": "left_claw_joint",
+    "installed_side": "right",
     "right_joint_name": "right_claw_joint",
     "require_feedback": false,
     "open_position": 1.0,

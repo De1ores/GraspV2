@@ -12,6 +12,7 @@ OmniPicker 双夹爪控制——参赛学生任务版
   python3 omnipicker_hand_student.py --publish close left
   python3 omnipicker_hand_student.py --publish open right
   python3 omnipicker_hand_student.py --publish close right
+  python3 omnipicker_hand_student.py --publish position right 0.35
 
 说明：
   1. 机器人模式和夹爪参数由赛项工作人员预先配置，不属于本任务内容。
@@ -93,7 +94,14 @@ def create_hand_command(joint_name, target_position):
 
     提示：target_position 已由参数解析部分限制在 0.0～1.0。
     """
-    raise NotImplementedError("请完成 TODO 1：创建单侧夹爪命令")
+    command = HandCommand()
+    command.name = joint_name
+    command.position = float(target_position)
+    command.velocity = 1.0
+    command.acceleration = 1.0
+    command.deceleration = 1.0
+    command.effort = 1.0
+    return command
 
 
 def build_hand_message(hand, target_position):
@@ -108,7 +116,30 @@ def build_hand_message(hand, target_position):
     hand 的取值只会是 "left" 或 "right"。
     左右夹爪的逻辑关节名称已在文件顶部给出。
     """
-    raise NotImplementedError("请完成 TODO 2：组装夹爪控制消息")
+    message = HandCommandArray()
+    message.header = MessageHeader()
+    message.header.frame_id = "hand_command"
+
+    # NONE=0 表示本帧不控制该侧，CLAW=2 表示 OmniPicker 夹爪。
+    message.left_hand_type = HandType(value=0)
+    message.right_hand_type = HandType(value=0)
+    message.left_hands = []
+    message.right_hands = []
+
+    if hand == "left":
+        message.left_hand_type = HandType(value=2)
+        message.left_hands = [
+            create_hand_command(LEFT_JOINT_NAME, target_position)
+        ]
+    elif hand == "right":
+        message.right_hand_type = HandType(value=2)
+        message.right_hands = [
+            create_hand_command(RIGHT_JOINT_NAME, target_position)
+        ]
+    else:
+        raise ValueError(f"不支持的夹爪侧：{hand!r}")
+
+    return message
 
 
 class OmniPickerStudentNode(Node):
@@ -141,11 +172,50 @@ class OmniPickerStudentNode(Node):
 
         注意：不要改为只发布一帧。
         """
-        raise NotImplementedError("请完成 TODO 3：持续发布夹爪命令")
+        message = build_hand_message(hand, target_position)
+        period_seconds = 1.0 / PUBLISH_FREQUENCY_HZ
+        started_at = time.monotonic()
+        deadline = started_at + PUBLISH_DURATION_SECONDS
+        next_publish_at = started_at
+        published_frames = 0
+
+        while rclpy.ok() and time.monotonic() < deadline:
+            stamp = self.get_clock().now().to_msg()
+            message.header.stamp = stamp
+            message.header.meas_stamp = stamp
+            message.header.sequence = published_frames
+            self.publisher.publish(message)
+            published_frames += 1
+
+            # 保持节点处理 ROS 2 事件，同时以单调时钟维持 50 Hz。
+            rclpy.spin_once(self, timeout_sec=0.0)
+            next_publish_at += period_seconds
+            remaining = next_publish_at - time.monotonic()
+            if remaining > 0.0:
+                time.sleep(remaining)
+            else:
+                next_publish_at = time.monotonic()
+
+        print(
+            f"已向 {hand} 夹爪发布 {published_frames} 帧，"
+            f"目标位置 {target_position:.3f}。"
+        )
+
+
+def normalized_position(value):
+    """解析并校验 0.0～1.0 的归一化夹爪开度。"""
+    try:
+        position = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("开度必须是数字") from exc
+
+    if not 0.0 <= position <= 1.0:
+        raise argparse.ArgumentTypeError("开度必须位于 0.0～1.0")
+    return position
 
 
 def parse_arguments():
-    """解析命令行参数。此函数无需修改。"""
+    """解析命令行参数。"""
     parser = argparse.ArgumentParser(
         description="OmniPicker 双夹爪控制参赛学生任务版"
     )
@@ -156,15 +226,28 @@ def parse_arguments():
     )
     parser.add_argument(
         "action",
-        choices=("open", "close"),
-        help="夹爪动作：open 为打开，close 为闭合",
+        choices=("open", "close", "position"),
+        help="夹爪动作：open 打开，close 闭合，position 指定归一化开度",
     )
     parser.add_argument(
         "hand",
         choices=("left", "right"),
         help="目标夹爪：left 为左夹爪，right 为右夹爪",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "target_position",
+        nargs="?",
+        type=normalized_position,
+        metavar="POSITION",
+        help="position 动作的目标开度，范围 0.0～1.0",
+    )
+    args = parser.parse_args()
+
+    if args.action == "position" and args.target_position is None:
+        parser.error("position 动作必须提供 0.0～1.0 的 POSITION")
+    if args.action != "position" and args.target_position is not None:
+        parser.error("只有 position 动作可以提供 POSITION")
+    return args
 
 
 def main():
@@ -175,8 +258,13 @@ def main():
         print("完成全部 TODO 并确认现场安全后，再使用 --publish。")
         return
 
-    # 本赛项定义：0.0 为闭合，1.0 为打开。
-    target_position = 1.0 if args.action == "open" else 0.0
+    # 本赛项定义：0.0 为闭合，1.0 为打开，中间值为部分开合。
+    if args.action == "open":
+        target_position = 1.0
+    elif args.action == "close":
+        target_position = 0.0
+    else:
+        target_position = args.target_position
 
     rclpy.init()
     node = OmniPickerStudentNode()

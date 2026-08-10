@@ -19,7 +19,13 @@ from .planner import (
     preview_scene,
     replay_viewer,
 )
-from .robot_profiles import PROFILES, RobotProfile, get_robot_profile
+from .robot_profiles import (
+    AVAILABLE_GRIPPER_SIDES,
+    INSTALLED_GRIPPER_SIDE,
+    PROFILES,
+    RobotProfile,
+    get_robot_profile,
+)
 from .trajectory import TrajectoryValidationError, load_trajectory
 
 
@@ -46,10 +52,7 @@ def _parser() -> argparse.ArgumentParser:
   ./run.sh --headless
       使用同一桌子和规划，但不打开窗口，适用于 SSH/Orin。
 
-  ./run.sh --robot ultra
-      使用同一份上次视觉结果，为 Ultra 规划并打开 Viewer。
-
-  ./run.sh --robot youth --vision-result output/result.json
+  ./run.sh --vision-result output/result.json
       显式指定另一份视觉结果；语义与默认路径相同。
 
   ./run.sh --target 0.38 -0.30 0.92
@@ -58,13 +61,13 @@ def _parser() -> argparse.ArgumentParser:
   ./run.sh --no-vision
       不读取视觉 JSON，不生成桌面障碍，改用内置可达测试目标。
 
-  ./run.sh --robot youth --mode animation
+  ./run.sh --mode animation
       把已验证轨迹转换为 CSV；完全离线，不连接机器人。
 
-  ./run.sh --robot youth --mode animation --animation /path/to/action.csv
+  ./run.sh --mode animation --animation /path/to/action.csv
       校验并准备重放已有 CSV，不重新规划或覆盖该文件。
 
-  ./run.sh --robot youth --mode animation --execute
+  ./run.sh --mode animation --execute
       真机只读预检、上传校验并在再次输入 RUN 后播放。
 
 坐标约定：米；+X 向机器人前方，+Y 向机器人左侧，+Z 向上。
@@ -73,11 +76,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--robot",
         choices=tuple(PROFILES),
-        default="youth",
-        help=(
-            "机器人配置（默认 youth）；youth=每臂5轴，ultra=每臂7轴，"
-            "future_upper 尚未拿到比赛机模型，当前会安全拒绝运行"
-        ),
+        default="ultra",
+        help="兼容旧命令的机型参数；当前只支持 ultra（默认）",
     )
     parser.add_argument(
         "--mode",
@@ -87,11 +87,9 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--side",
-        choices=("auto", "left", "right"),
-        default="auto",
-        help=(
-            "规划手臂（默认 auto）；优先使用目标同侧手臂，规划失败时自动尝试另一只手"
-        ),
+        choices=AVAILABLE_GRIPPER_SIDES,
+        default=INSTALLED_GRIPPER_SIDE,
+        help="抓取手臂（固定 right）；比赛机器人仅右手安装 OmniPicker",
     )
     parser.add_argument(
         "--robot-urdf",
@@ -251,63 +249,30 @@ def _resolve_vision_result(args: argparse.Namespace) -> Path | None:
     return source
 
 
-def _automatic_side_order(
-    args: argparse.Namespace,
-    vision_result: Path | None,
-) -> tuple[str, ...]:
-    """Return the requested side or both sides in deterministic preference order."""
-    if args.side != "auto":
-        return (args.side,)
-    target = args.target
-    if target is None and vision_result is not None:
-        try:
-            document = json.loads(vision_result.read_text(encoding="utf-8"))
-            raw_target = document.get("grasp_point_mujoco_m")
-            if isinstance(raw_target, list) and len(raw_target) == 3:
-                target = raw_target
-        except (OSError, json.JSONDecodeError):
-            # plan_trajectory will emit the authoritative input error.  The
-            # fallback order remains deterministic if this lightweight hint
-            # cannot be read here.
-            target = None
-    preferred = "left" if target is not None and float(target[1]) >= 0.0 else "right"
-    alternate = "right" if preferred == "left" else "left"
-    return preferred, alternate
+def _grasp_side(args: argparse.Namespace) -> str:
+    """Return the only arm fitted with the competition OmniPicker."""
+    if args.side != INSTALLED_GRIPPER_SIDE:
+        raise RuntimeError(
+            "grasp planning is restricted to the right arm because the "
+            "competition robot has no left OmniPicker"
+        )
+    return INSTALLED_GRIPPER_SIDE
 
 
-def _plan_with_side_fallback(
+def _plan_with_installed_gripper(
     args: argparse.Namespace,
     profile: RobotProfile,
     vision_result: Path | None,
 ):
-    sides = _automatic_side_order(args, vision_result)
-    if len(sides) == 2:
-        print(f"Automatic arm order: {sides[0]} -> {sides[1]}")
-    failures: list[tuple[str, str]] = []
-    for index, side in enumerate(sides):
-        if index:
-            print(f"Retrying the same target with the {side} arm.")
-        try:
-            result = plan_trajectory(
-                profile,
-                side=side,
-                target_world_xyz=args.target,
-                vision_result=vision_result,
-                robot_urdf=args.robot_urdf,
-                table_clearance_m=args.table_clearance,
-                approach_distance_m=args.approach_distance,
-            )
-            if len(sides) == 2:
-                print(f"Automatic arm selection: {side}")
-            return result
-        except RuntimeError as error:
-            failures.append((side, str(error)))
-            if index + 1 < len(sides):
-                print(f"{side.capitalize()} arm planning failed: {error}", file=sys.stderr)
-    if len(failures) == 1:
-        raise RuntimeError(failures[0][1])
-    details = "; ".join(f"{side}: {message}" for side, message in failures)
-    raise RuntimeError(f"automatic arm planning failed for both arms; {details}")
+    return plan_trajectory(
+        profile,
+        side=_grasp_side(args),
+        target_world_xyz=args.target,
+        vision_result=vision_result,
+        robot_urdf=args.robot_urdf,
+        table_clearance_m=args.table_clearance,
+        approach_distance_m=args.approach_distance,
+    )
 
 
 def _plan(args: argparse.Namespace, profile: RobotProfile):
@@ -317,7 +282,7 @@ def _plan(args: argparse.Namespace, profile: RobotProfile):
         if vision_result is not None
         else "Vision obstacle: disabled (--no-vision)"
     )
-    result = _plan_with_side_fallback(args, profile, vision_result)
+    result = _plan_with_installed_gripper(args, profile, vision_result)
     trajectory = args.trajectory.expanduser().resolve()
     report = args.report.expanduser().resolve()
     result.write(trajectory, report)
@@ -388,6 +353,12 @@ def _validate_trajectory_profile(path: Path, profile: RobotProfile) -> None:
         raise TrajectoryValidationError(
             f"trajectory was generated for {declared!r}, not {profile.name!r}"
         )
+    side = document.get("arm_side")
+    if side != INSTALLED_GRIPPER_SIDE:
+        raise TrajectoryValidationError(
+            "trajectory must use the right arm because the competition robot "
+            "has no left OmniPicker"
+        )
     planning = document.get("planning")
     if not isinstance(planning, dict):
         raise TrajectoryValidationError("trajectory has no planning verification")
@@ -398,8 +369,6 @@ def _validate_trajectory_profile(path: Path, profile: RobotProfile) -> None:
 
 
 def _animation(args: argparse.Namespace, profile: RobotProfile) -> int:
-    if not profile.animation_supported:
-        raise RuntimeError(f"{profile.name} has no verified animation backend")
     existing_animation = args.animation is not None
     if existing_animation:
         animation_path = args.animation.expanduser().resolve()
@@ -422,14 +391,6 @@ def _animation(args: argparse.Namespace, profile: RobotProfile) -> int:
             trajectory_path,
             maximum_allowed_velocity=profile.maximum_velocity_rad_s + 1e-6,
         )
-        unavailable = sorted(
-            set(trajectory.joint_names) & set(profile.absent_animation_joints)
-        )
-        if unavailable:
-            raise TrajectoryValidationError(
-                f"{profile.name} trajectory commands unavailable joints: "
-                + ", ".join(unavailable)
-            )
         animation = build_mc_animation(
             trajectory,
             speed_scale=args.speed_scale,
@@ -458,8 +419,6 @@ def _animation(args: argparse.Namespace, profile: RobotProfile) -> int:
         str(backend),
         "--animation",
         str(animation_path),
-        "--robot",
-        profile.name,
     ]
     if args.yes:
         command.append("--yes")

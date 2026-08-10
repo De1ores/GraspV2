@@ -8,12 +8,12 @@
   "convention": "T_parent_tcp = translation_m followed by fixed-axis roll-pitch-yaw; values are expressed in the named OmniPicker base-link frame",
   "left": {
     "parent_frame": "L_omnipicker_base_link",
-    "translation_m": [0.0, 0.0, 0.20],
+    "translation_m": [0.0, 0.0, 0.0],
     "rpy_rad": [0.0, 0.0, 0.0]
   },
   "right": {
     "parent_frame": "R_omnipicker_base_link",
-    "translation_m": [0.0, 0.0, 0.20],
+    "translation_m": [0.0, 0.0, 0.14],
     "rpy_rad": [0.0, 0.0, 0.0]
   },
   "calibration_note": "Measure from the OmniPicker base-link origin to the real grasp center. Positive/negative directions follow that local link frame, not MuJoCo world axes. Restart graspV2 after editing."

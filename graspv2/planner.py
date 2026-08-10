@@ -13,7 +13,11 @@ from typing import Iterable
 import numpy as np
 
 from .official_ik import OfficialIK, WorldIKResult
-from .robot_profiles import RobotProfile
+from .robot_profiles import (
+    AVAILABLE_GRIPPER_SIDES,
+    INSTALLED_GRIPPER_SIDE,
+    RobotProfile,
+)
 from .simulation import (
     CollisionReport,
     RobotSimulation,
@@ -418,9 +422,11 @@ def plan_trajectory(
 ) -> PlannedTrajectory:
     """Plan and densely verify one approach trajectory in MuJoCo."""
     started = time.monotonic()
-    profile.assert_planning_enabled()
-    if side not in ("left", "right"):
-        raise ValueError("side must be left or right")
+    if side not in AVAILABLE_GRIPPER_SIDES:
+        raise ValueError(
+            "grasp side must be right because the competition robot has no "
+            "left OmniPicker"
+        )
     if not 0.0 <= table_clearance_m <= 0.10:
         raise ValueError("table_clearance_m must be within [0, 0.10]")
     if not 0.01 <= approach_distance_m <= 0.30:
@@ -556,6 +562,7 @@ def plan_trajectory(
         "trajectory_role": "approach",
         "robot_profile": profile.name,
         "arm_side": side,
+        "installed_gripper_side": INSTALLED_GRIPPER_SIDE,
         "ik_backend": "x2_ik_sdk.X2ArmIKSolver",
         "kinematic_urdf": str(ik.urdf_path),
         "tool_pose_calibration": str(ik.tool_pose.source_path),
@@ -633,12 +640,16 @@ def plan_lift_trajectory(
 ) -> PlannedTrajectory:
     """Plan a collision-checked Cartesian lift from an approach endpoint."""
 
+    if approach.side not in AVAILABLE_GRIPPER_SIDES:
+        raise ValueError(
+            "lift side must be right because the competition robot has no "
+            "left OmniPicker"
+        )
     if not 0.03 <= lift_height_m <= 0.30:
         raise ValueError("lift_height_m must be within [0.03, 0.30]")
     if not 0.5 <= lift_duration_s <= 10.0:
         raise ValueError("lift_duration_s must be within [0.5, 10.0]")
     profile = approach.profile
-    profile.assert_planning_enabled()
     started = time.monotonic()
     ik = OfficialIK(profile)
     simulation = RobotSimulation(
@@ -732,6 +743,7 @@ def plan_lift_trajectory(
         "trajectory_role": "lift",
         "robot_profile": profile.name,
         "arm_side": approach.side,
+        "installed_gripper_side": INSTALLED_GRIPPER_SIDE,
         "ik_backend": "x2_ik_sdk.X2ArmIKSolver",
         "kinematic_urdf": str(ik.urdf_path),
         "tool_pose_calibration": str(ik.tool_pose.source_path),

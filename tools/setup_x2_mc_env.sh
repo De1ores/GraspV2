@@ -7,19 +7,9 @@ fi
 
 graspv2_env_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
-graspv2_aimdk_setup="${GRASPV2_AIMDK_SETUP:-}"
-if [[ -z "${graspv2_aimdk_setup}" ]]; then
-  for graspv2_aimdk_candidate in \
-    "${graspv2_env_root}/aimdk0907_install/setup.bash" \
-    "/home/svt/Raicom2026-old/aimdk_msgs/install/setup.bash"; do
-    if [[ -f "${graspv2_aimdk_candidate}" ]]; then
-      graspv2_aimdk_setup="${graspv2_aimdk_candidate}"
-      break
-    fi
-  done
-fi
-if [[ -z "${graspv2_aimdk_setup}" || ! -f "${graspv2_aimdk_setup}" ]]; then
-  echo "Missing matching AimDK overlay; run tools/build_graspv2_with_installed_aimdk.sh" >&2
+if ! graspv2_aimdk_setup="$(
+  "${graspv2_env_root}/tools/select_aimdk_setup.sh"
+)"; then
   return 1
 fi
 if [[ ! -f "${graspv2_env_root}/install/local_setup.bash" ]]; then
@@ -36,6 +26,9 @@ fi
 source /opt/ros/humble/setup.bash
 source "${graspv2_aimdk_setup}"
 source "${graspv2_env_root}/install/local_setup.bash"
+
+export GRASPV2_AIMDK_SETUP="${graspv2_aimdk_setup}"
+export GRASPV2_X2_ENV_READY=1
 
 if [[ "${graspv2_env_restore_nounset}" == true ]]; then
   set -u

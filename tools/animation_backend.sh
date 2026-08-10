@@ -9,8 +9,6 @@ robot_user="${GRASPV2_ROBOT_USER:-agi}"
 robot_source_address="${GRASPV2_ROBOT_SOURCE_ADDRESS:-}"
 robot_animation="/tmp/graspv2_mc_animation.csv"
 assume_yes=false
-robot_profile=""
-expected_arm_dof=""
 
 while (($#)); do
   case "$1" in
@@ -23,16 +21,6 @@ while (($#)); do
       assume_yes=true
       shift
       ;;
-    --robot)
-      [[ $# -ge 2 ]] || { echo "--robot requires a profile" >&2; exit 2; }
-      robot_profile="$2"
-      case "$robot_profile" in
-        youth) expected_arm_dof=10 ;;
-        ultra) expected_arm_dof=14 ;;
-        *) echo "Unsupported live animation profile: $robot_profile" >&2; exit 2 ;;
-      esac
-      shift 2
-      ;;
     *)
       echo "Unknown internal animation option: $1" >&2
       exit 2
@@ -43,10 +31,6 @@ done
 [[ -n "$animation" && -f "$animation" ]] || {
   echo "MC animation CSV not found: $animation" >&2
   exit 1
-}
-[[ -n "$expected_arm_dof" ]] || {
-  echo "Internal animation backend requires --robot youth|ultra" >&2
-  exit 2
 }
 animation="$(realpath -- "$animation")"
 
@@ -65,7 +49,6 @@ echo "Live step 1/3: read-only MC and arm preflight"
 ros2 run graspv2 x2_mc_custom_grasp \
   --animation "$animation" \
   --robot-animation-path "$robot_animation" \
-  --expected-arm-dof "$expected_arm_dof" \
   --preflight
 
 local_checksum="$(sha256sum -- "$animation")"
@@ -83,7 +66,7 @@ echo "Ready to play through MC animation_player:"
 echo "  local CSV:  $animation"
 echo "  SHA-256:    $local_checksum"
 echo "  robot file: $robot_user@$robot_address:$robot_animation"
-echo "  profile:    $robot_profile ($expected_arm_dof physical arm joints)"
+echo "  profile:    ultra (14 physical arm joints)"
 echo "  MC remains in control of balance; the CSV contains its return path."
 if [[ "$assume_yes" != true ]]; then
   read -r -p "Type RUN (case-insensitive) to upload and start motion: " confirmation
@@ -118,5 +101,4 @@ echo "Live step 3/3: request one non-interrupting ani_path playback"
 ros2 run graspv2 x2_mc_custom_grasp \
   --animation "$animation" \
   --robot-animation-path "$robot_animation" \
-  --expected-arm-dof "$expected_arm_dof" \
   --execute

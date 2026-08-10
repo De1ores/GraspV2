@@ -42,12 +42,7 @@ class OfficialIK:
         profile: RobotProfile,
         tool_pose_path: Path | None = None,
     ):
-        profile.assert_planning_enabled()
-        base_config = (
-            X2IKConfig.default_omnipicker_5dof()
-            if profile.arm_dof == 5
-            else X2IKConfig.default_omnipicker()
-        )
+        base_config = X2IKConfig.default_omnipicker()
         tool_pose = load_tool_pose_config(profile, tool_pose_path)
         config = replace(
             base_config,

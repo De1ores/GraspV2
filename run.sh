@@ -2,6 +2,19 @@
 set -euo pipefail
 
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# WSLg may expose a D3D12 device even when GPU access is blocked.  MuJoCo's
+# GLFW viewer can then crash during native driver teardown.  The software
+# renderer is slower but deterministic for this small planning scene.  Set
+# GRASPV2_WSL_SOFTWARE_GL=0 after confirming accelerated WSLg OpenGL works.
+if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null && \
+   [[ "${GRASPV2_WSL_SOFTWARE_GL:-1}" != "0" ]]; then
+  export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}"
+  export MESA_LOADER_DRIVER_OVERRIDE="${MESA_LOADER_DRIVER_OVERRIDE:-llvmpipe}"
+  export GALLIUM_DRIVER="${GALLIUM_DRIVER:-llvmpipe}"
+  export MUJOCO_GL="${MUJOCO_GL:-glfw}"
+fi
+
 if [[ -x "$repo_dir/.planning-venv/bin/python" ]]; then
   default_python="$repo_dir/.planning-venv/bin/python"
 else
@@ -20,6 +33,11 @@ fi
 
 if ! PYTHONPATH="$repo_dir/x2_ik_sdk/src:$repo_dir${PYTHONPATH:+:$PYTHONPATH}" \
   "$python_bin" -c 'import mujoco, numpy, x2_ik_sdk' >/dev/null 2>&1; then
+  if [[ "${GRASPV2_OFFLINE:-0}" == "1" ]]; then
+    echo "Offline planning environment is incomplete: $python_bin" >&2
+    echo "Run ./install_offline.sh from the complete deployment bundle." >&2
+    exit 1
+  fi
   echo "Installing planning dependencies (first run only)"
   (cd "$repo_dir" && "$python_bin" -m pip install -r requirements.txt)
 fi

@@ -2,6 +2,12 @@
 set -euo pipefail
 
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "${GRASPV2_X2_ENV_READY:-0}" != "1" ]]; then
+  # Direct invocations must use the same ROS/AimDK/project overlay ordering as
+  # offline_run.sh, including the initial X2 RGB-D capture.
+  # shellcheck source=/dev/null
+  source "$repo_dir/tools/setup_x2_mc_env.sh"
+fi
 vision_result="$repo_dir/output/result.json"
 if [[ -n "${GRASPV2_PLANNING_PYTHON:-}" ]]; then
   planning_python="$GRASPV2_PLANNING_PYTHON"
@@ -11,8 +17,7 @@ else
   planning_python="$repo_dir/.venv/bin/python"
 fi
 target_class=""
-robot=""
-side="auto"
+robot="ultra"
 vision_conf="0.20"
 table_clearance="0.025"
 lift_height="0.10"
@@ -33,17 +38,16 @@ assume_yes=false
 
 usage() {
   cat <<'EOF'
-Usage: ./run_full_grasp_pipeline.sh --target-class NAME --robot youth|ultra [options]
+Usage: ./run_full_grasp_pipeline.sh --target-class NAME [options]
 
 Capture RGB-D, recognize exactly one requested object class, plan collision-
 checked approach/lift paths, and prepare a visually verified grasp sequence.
 
 Required:
-  --target-class NAME       Object class/prompt, for example bottle, cup, or "game controller".
-  --robot youth|ultra       Robot joint profile; youth=5 DoF/arm, ultra=7 DoF/arm.
-
+  --target-class NAME       Competition prompt: cup, "orange-capped pill bottle",
+                            or "bag of corn bread".
 Options:
-  --side auto|left|right    Planning arm (default: auto; target side first, then fallback).
+  --robot ultra             Compatibility option; Ultra is the only supported model.
   --vision-conf VALUE       Detection threshold (default: 0.20).
   --table-clearance METERS  Required table clearance (default: 0.025).
   --lift-height METERS      Lift distance along the table normal (default: 0.10).
@@ -65,7 +69,8 @@ Options:
                             Required observed fraction of lift (default: 0.60).
   --maximum-lateral-drift METERS
                             Allowed object drift during lift (default: 0.08).
-  --use-existing-vision     Reuse output/result.json after verifying its class.
+  --use-existing-vision     Reuse output/result.json for dry-run/plan-only.
+                            Live execution always requires a fresh RGB-D capture.
   --plan-only               Stop after recognition and collision-checked planning.
   --execute                 Execute only after calibration confirmation and typing RUN.
   --confirm-calibrated      Required with --execute; confirms real extrinsics were checked.
@@ -78,12 +83,11 @@ EOF
 
 while (($#)); do
   case "$1" in
-    --target-class|--robot|--side|--vision-conf|--table-clearance|--lift-height|--lift-duration|--capture-backend|--verification-capture-backend|--camera-calibration|--verification-timeout|--close-target-tolerance|--lifted-target-tolerance|--minimum-lift-ratio|--maximum-lateral-drift)
+    --target-class|--robot|--vision-conf|--table-clearance|--lift-height|--lift-duration|--capture-backend|--verification-capture-backend|--camera-calibration|--verification-timeout|--close-target-tolerance|--lifted-target-tolerance|--minimum-lift-ratio|--maximum-lateral-drift)
       (($# >= 2)) || { echo "$1 requires a value" >&2; exit 2; }
       case "$1" in
         --target-class) target_class="$2" ;;
         --robot) robot="$2" ;;
-        --side) side="$2" ;;
         --vision-conf) vision_conf="$2" ;;
         --table-clearance) table_clearance="$2" ;;
         --lift-height) lift_height="$2" ;;
@@ -133,12 +137,8 @@ done
 
 [[ -n "$target_class" ]] || { echo "--target-class is required" >&2; exit 2; }
 case "$robot" in
-  youth|ultra) ;;
-  *) echo "--robot must be youth or ultra" >&2; exit 2 ;;
-esac
-case "$side" in
-  auto|left|right) ;;
-  *) echo "--side must be auto, left or right" >&2; exit 2 ;;
+  ultra) ;;
+  *) echo "--robot only supports ultra" >&2; exit 2 ;;
 esac
 case "$capture_backend" in
   x2-aimdk|orbbec-sdk|existing) ;;
@@ -159,6 +159,10 @@ if [[ "$execute" == true && "$confirm_calibrated" != true ]]; then
   echo "Execution blocked: add --confirm-calibrated only after checking camera-to-robot calibration." >&2
   exit 2
 fi
+if [[ "$execute" == true && ( "$capture" != true || "$capture_backend" == "existing" ) ]]; then
+  echo "Execution blocked: live grasp requires a fresh RGB-D capture; --use-existing-vision and --capture-backend existing are dry-run only." >&2
+  exit 2
+fi
 if [[ "$assume_yes" == true && "$execute" != true ]]; then
   echo "--yes is only valid with --execute" >&2
   exit 2
@@ -171,10 +175,10 @@ fi
 export GRASPV2_PYTHON="$planning_python"
 
 mkdir -p "$repo_dir/output"
-trajectory="$repo_dir/output/planned_trajectory_${robot}.json"
-planning_report="$repo_dir/output/planning_report_${robot}.json"
-lift_trajectory="$repo_dir/output/planned_lift_${robot}.json"
-lift_report="$repo_dir/output/planning_report_lift_${robot}.json"
+trajectory="$repo_dir/output/planned_trajectory.json"
+planning_report="$repo_dir/output/planning_report.json"
+lift_trajectory="$repo_dir/output/planned_lift.json"
+lift_report="$repo_dir/output/planning_report_lift.json"
 grasp_status="$repo_dir/output/grasp_status.json"
 
 echo "[1/3] RGB-D recognition: class=$target_class"
@@ -212,11 +216,9 @@ print(f"Vision class gate passed: {actual}")
 PY
 
 echo
-echo "[2/3] Official IK and MuJoCo gate: robot=$robot side=$side"
+echo "[2/3] Official IK and MuJoCo gate: Ultra/right OmniPicker"
 "$repo_dir/run.sh" \
-  --robot "$robot" \
   --mode sim \
-  --side "$side" \
   --headless \
   --vision-result "$vision_result" \
   --trajectory "$trajectory" \
@@ -233,9 +235,8 @@ if [[ "$plan_only" == true ]]; then
 fi
 
 echo
-echo "[3/3] Visual grasp sequence: robot=$robot lift=${lift_duration}s/${lift_height}m"
+echo "[3/3] Visual grasp sequence: Ultra/right lift=${lift_duration}s/${lift_height}m"
 grasp_args=(
-  --robot "$robot"
   --approach-trajectory "$trajectory"
   --lift-trajectory "$lift_trajectory"
   --initial-vision "$vision_result"
@@ -256,12 +257,10 @@ fi
 if [[ "$execute" == true ]]; then
   grasp_args+=(--execute --confirm-control-authority)
   if [[ "$assume_yes" != true ]]; then
-    echo "Live sequence will move the $side arm and OmniPicker. Type RUN to continue:"
+    echo "Live sequence will move the right arm and OmniPicker. Type RUN to continue:"
     read -r confirmation
     [[ "$confirmation" == "RUN" ]] || { echo "Execution cancelled."; exit 1; }
   fi
-  # shellcheck source=/dev/null
-  source "$repo_dir/tools/setup_x2_mc_env.sh"
   ros2 run graspv2 x2_aimdk_hardware grasp "${grasp_args[@]}"
 else
   PYTHONPATH="$repo_dir${PYTHONPATH:+:$PYTHONPATH}" \

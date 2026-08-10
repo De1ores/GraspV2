@@ -16,14 +16,12 @@ LEFT_ARM_7 = (
     "left_wrist_roll_joint",
 )
 RIGHT_ARM_7 = tuple(name.replace("left_", "right_", 1) for name in LEFT_ARM_7)
-LEFT_ARM_5 = LEFT_ARM_7[:5]
-RIGHT_ARM_5 = RIGHT_ARM_7[:5]
-OPTIONAL_WRISTS = (
-    "left_wrist_pitch_joint",
-    "left_wrist_roll_joint",
-    "right_wrist_pitch_joint",
-    "right_wrist_roll_joint",
-)
+
+# The competition robot has one OmniPicker, mounted on the right arm.  Keep
+# this topology in the shared profile module so planning, simulation and the
+# live hardware boundary cannot silently disagree about the grasping side.
+INSTALLED_GRIPPER_SIDE = "right"
+AVAILABLE_GRIPPER_SIDES = (INSTALLED_GRIPPER_SIDE,)
 
 # animation_player standing values, ordered as left-7 then right-7. Planning
 # starts here so the CSV's lead-in bridge is a collision-neutral hold.
@@ -57,9 +55,6 @@ class RobotProfile:
     right_ee_frame: str
     base_world_xyz: tuple[float, float, float]
     maximum_velocity_rad_s: float
-    animation_supported: bool
-    planning_enabled: bool = True
-    disabled_reason: str = ""
 
     @property
     def arm_dof(self) -> int:
@@ -70,11 +65,6 @@ class RobotProfile:
     @property
     def arm_pos_order(self) -> tuple[str, ...]:
         return self.left_arm_joints + self.right_arm_joints
-
-    @property
-    def absent_animation_joints(self) -> tuple[str, ...]:
-        active = set(self.arm_pos_order)
-        return tuple(name for name in LEFT_ARM_7 + RIGHT_ARM_7 if name not in active)
 
     def mc_start_arm_pos(self) -> list[float]:
         """Return physical arm values extracted from animation_player order."""
@@ -88,55 +78,21 @@ class RobotProfile:
             return self.right_arm_joints
         raise ValueError(f"unsupported arm side: {side!r}")
 
-    def assert_planning_enabled(self) -> None:
-        if not self.planning_enabled:
-            reason = self.disabled_reason or "profile is not configured"
-            raise RuntimeError(f"robot profile {self.name!r} is disabled: {reason}")
-
-
 # arm_sim's stable_stand pelvis height. Planning targets and vision results are
 # expressed in that MuJoCo world; the official SDK keeps base_link at the origin.
 _STABLE_STAND_BASE_WORLD = (0.0, 0.0, 0.666452127019)
 
 
 PROFILES: Mapping[str, RobotProfile] = {
-    "youth": RobotProfile(
-        name="youth",
-        description="X2 youth, five arm joints per side and fixed optional wrists",
-        left_arm_joints=LEFT_ARM_5,
-        right_arm_joints=RIGHT_ARM_5,
-        left_ee_frame="L_omnipicker_base_link",
-        right_ee_frame="R_omnipicker_base_link",
-        base_world_xyz=_STABLE_STAND_BASE_WORLD,
-        maximum_velocity_rad_s=0.30,
-        animation_supported=True,
-    ),
     "ultra": RobotProfile(
         name="ultra",
-        description="X2 Ultra/Ultra Plus, seven arm joints per side",
+        description="X2 Ultra, seven arm joints per side",
         left_arm_joints=LEFT_ARM_7,
         right_arm_joints=RIGHT_ARM_7,
         left_ee_frame="L_omnipicker_base_link",
         right_ee_frame="R_omnipicker_base_link",
         base_world_xyz=_STABLE_STAND_BASE_WORLD,
         maximum_velocity_rad_s=0.30,
-        animation_supported=True,
-    ),
-    "future_upper": RobotProfile(
-        name="future_upper",
-        description="Reserved competition upper-body robot profile",
-        left_arm_joints=LEFT_ARM_7,
-        right_arm_joints=RIGHT_ARM_7,
-        left_ee_frame="L_omnipicker_base_link",
-        right_ee_frame="R_omnipicker_base_link",
-        base_world_xyz=(0.0, 0.0, 0.0),
-        maximum_velocity_rad_s=0.20,
-        animation_supported=False,
-        planning_enabled=False,
-        disabled_reason=(
-            "competition URDF, base transform and command interface have not "
-            "been supplied"
-        ),
     ),
 }
 

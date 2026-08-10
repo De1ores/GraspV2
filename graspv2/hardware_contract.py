@@ -15,7 +15,12 @@ from pathlib import Path
 import sys
 from typing import Mapping, Protocol, Sequence
 
-from .robot_profiles import LEFT_ARM_7, RIGHT_ARM_7, RobotProfile
+from .robot_profiles import (
+    INSTALLED_GRIPPER_SIDE,
+    LEFT_ARM_7,
+    RIGHT_ARM_7,
+    RobotProfile,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,6 +72,10 @@ class AimDKServices:
 
     get_mc_action: str = "/aimdk_5Fmsgs/srv/GetMcAction"
     set_mc_action: str = "/aimdk_5Fmsgs/srv/SetMcAction"
+    get_current_input_source: str = (
+        "/aimdk_5Fmsgs/srv/GetCurrentInputSource"
+    )
+    set_mc_input_source: str = "/aimdk_5Fmsgs/srv/SetMcInputSource"
 
 
 @dataclass(frozen=True)
@@ -87,13 +96,16 @@ class UpperBodyTuning:
     maximum_tracking_error_rad: float = 0.35
     maximum_temperature_c: int = 80
     final_hold_s: float = 0.30
+    service_discovery_timeout_s: float = 15.0
     service_timeout_s: float = 0.50
     service_retries: int = 8
     mode_timeout_s: float = 5.0
     running_mode_status: int = 100
     stable_mode: str = "STAND_DEFAULT"
     split_mode: str = "UPPERBODY_REMOTE_SPLIT"
-    command_source: str = "remote_teleop_pc"
+    command_source: str = "graspv2"
+    command_source_priority: int = 65
+    command_source_timeout_ms: int = 1000
     mode_source: str = "rc"
 
 
@@ -101,7 +113,7 @@ class UpperBodyTuning:
 class OmniPickerTuning:
     """Normalized OmniPicker command settings from the AimDK contract."""
 
-    left_joint_name: str = "left_claw_joint"
+    installed_side: str = INSTALLED_GRIPPER_SIDE
     right_joint_name: str = "right_claw_joint"
     require_feedback: bool = False
     open_position: float = 1.0
@@ -201,8 +213,8 @@ def _construct_dataclass(cls, values: Mapping[str, object], label: str):
 
 
 def _validate_config(config: HardwareConfig) -> HardwareConfig:
-    if config.schema_version != 1:
-        raise HardwareContractError("hardware schema_version must be 1")
+    if config.schema_version != 2:
+        raise HardwareContractError("hardware schema_version must be 2")
     if not config.aimdk_api.strip():
         raise HardwareContractError("aimdk_api must be non-empty")
     for name, topic in vars(config.topics).items():
@@ -229,6 +241,7 @@ def _validate_config(config: HardwareConfig) -> HardwareConfig:
         "maximum_start_error_rad",
         "maximum_tracking_error_rad",
         "final_hold_s",
+        "service_discovery_timeout_s",
         "service_timeout_s",
         "mode_timeout_s",
     ):
@@ -243,26 +256,40 @@ def _validate_config(config: HardwareConfig) -> HardwareConfig:
         raise HardwareContractError(
             "upper_body.maximum_temperature_c must be positive"
         )
-    for name in ("service_retries", "running_mode_status"):
+    for name in (
+        "service_retries",
+        "running_mode_status",
+        "command_source_timeout_ms",
+    ):
         value = getattr(upper, name)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise HardwareContractError(
                 f"upper_body.{name} must be a positive integer"
             )
+    priority = upper.command_source_priority
+    if (
+        isinstance(priority, bool)
+        or not isinstance(priority, int)
+        or not 0 <= priority <= 100
+    ):
+        raise HardwareContractError(
+            "upper_body.command_source_priority must be an integer within [0, 100]"
+        )
     for name in ("stable_mode", "split_mode", "command_source", "mode_source"):
         value = getattr(upper, name)
         if not isinstance(value, str) or not value.strip():
             raise HardwareContractError(f"upper_body.{name} must be non-empty")
 
     hand = config.omnipicker
-    for name in ("left_joint_name", "right_joint_name"):
-        value = getattr(hand, name)
-        if not isinstance(value, str) or not value.strip():
-            raise HardwareContractError(f"omnipicker.{name} must be non-empty")
-    if hand.left_joint_name == hand.right_joint_name:
+    if hand.installed_side != INSTALLED_GRIPPER_SIDE:
         raise HardwareContractError(
-            "omnipicker left/right joint names must be different"
+            "omnipicker.installed_side must be 'right' for the competition robot"
         )
+    if (
+        not isinstance(hand.right_joint_name, str)
+        or not hand.right_joint_name.strip()
+    ):
+        raise HardwareContractError("omnipicker.right_joint_name must be non-empty")
     if not isinstance(hand.require_feedback, bool):
         raise HardwareContractError(
             "omnipicker.require_feedback must be a boolean"
@@ -289,6 +316,18 @@ def _validate_config(config: HardwareConfig) -> HardwareConfig:
     return config
 
 
+def require_installed_omnipicker_side(
+    config: HardwareConfig,
+    side: str,
+) -> None:
+    """Reject commands or plans for a side without a physical OmniPicker."""
+    if side != config.omnipicker.installed_side:
+        raise HardwareContractError(
+            f"OmniPicker is installed only on {config.omnipicker.installed_side}; "
+            f"refusing {side!r} gripper operation"
+        )
+
+
 def load_hardware_config(path: Path | None = None) -> HardwareConfig:
     """Load a strict JSON config, or use source/built-in defaults."""
 
@@ -298,7 +337,7 @@ def load_hardware_config(path: Path | None = None) -> HardwareConfig:
     if source is None:
         return _validate_config(
             HardwareConfig(
-                schema_version=1,
+                schema_version=2,
                 aimdk_api="v0.9.0.7/v1.0 topic-compatible",
                 topics=AimDKTopics(),
                 services=AimDKServices(),
@@ -451,18 +490,17 @@ def arm_setpoints(
 def upper_body_arm_positions(
     profile: RobotProfile, positions: Sequence[float]
 ) -> tuple[float, ...]:
-    """Expand a 10/14-axis profile state to MC's fixed left-7/right-7 order."""
+    """Validate an Ultra state in MC's fixed left-7/right-7 order."""
 
     if len(positions) != len(profile.arm_pos_order):
         raise HardwareContractError(
             f"profile arm position requires {len(profile.arm_pos_order)} values"
         )
-    values_by_name = {
-        name: _finite(value, f"{name}.position")
-        for name, value in zip(profile.arm_pos_order, positions)
-    }
+    if profile.arm_pos_order != LEFT_ARM_7 + RIGHT_ARM_7:
+        raise HardwareContractError("only the X2 Ultra 14-axis arm order is supported")
     return tuple(
-        values_by_name.get(name, 0.0) for name in LEFT_ARM_7 + RIGHT_ARM_7
+        _finite(value, f"{name}.position")
+        for name, value in zip(profile.arm_pos_order, positions)
     )
 
 

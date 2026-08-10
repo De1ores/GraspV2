@@ -16,7 +16,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 from .grasp_sequence import (
     GraspPlanMetadata,
@@ -41,11 +41,19 @@ from .hardware_contract import (
     UpperBodyFrame,
     arm_setpoints,
     load_hardware_config,
+    require_installed_omnipicker_side,
     resolve_joint_feedback,
     trajectory_sample_velocity,
     upper_body_arm_positions,
 )
-from .robot_profiles import PROFILES, RobotProfile, get_robot_profile
+from .robot_profiles import (
+    AVAILABLE_GRIPPER_SIDES,
+    INSTALLED_GRIPPER_SIDE,
+    PROFILES,
+    RobotProfile,
+    get_robot_profile,
+)
+from .ros_logging import configure_fastdds_logging
 from .trajectory import JointTrajectory, load_trajectory, reverse_trajectory
 
 
@@ -73,8 +81,12 @@ class _RosTypes:
     CommonRequest: type
     RequestHeader: type
     McActionCommand: type
+    McInputAction: type
+    McInputSource: type
     GetMcAction: type
     SetMcAction: type
+    GetCurrentInputSource: type
+    SetMcInputSource: type
 
 
 def _load_ros_types() -> _RosTypes:
@@ -96,12 +108,19 @@ def _load_ros_types() -> _RosTypes:
             JointCommandArray,
             JointStateArray,
             McActionCommand,
+            McInputAction,
+            McInputSource,
             MessageHeader,
             CommonRequest,
             RequestHeader,
             UpperBodyCommandArray,
         )
-        from aimdk_msgs.srv import GetMcAction, SetMcAction
+        from aimdk_msgs.srv import (
+            GetCurrentInputSource,
+            GetMcAction,
+            SetMcAction,
+            SetMcInputSource,
+        )
     except (ImportError, ModuleNotFoundError) as error:
         raise LiveHardwareError(
             "ROS 2/AimDK Python interfaces are unavailable. Source "
@@ -127,8 +146,12 @@ def _load_ros_types() -> _RosTypes:
         CommonRequest=CommonRequest,
         RequestHeader=RequestHeader,
         McActionCommand=McActionCommand,
+        McInputAction=McInputAction,
+        McInputSource=McInputSource,
         GetMcAction=GetMcAction,
         SetMcAction=SetMcAction,
+        GetCurrentInputSource=GetCurrentInputSource,
+        SetMcInputSource=SetMcInputSource,
     )
 
 
@@ -182,6 +205,8 @@ def require_aimdk_control_schema(types: _RosTypes) -> None:
             "hand_pos",
         },
         types.McActionCommand: {"action", "action_desc"},
+        types.McInputAction: {"value"},
+        types.McInputSource: {"name", "priority", "timeout"},
     }
     for message_type, required in expected.items():
         actual = _fields(message_type)
@@ -201,6 +226,10 @@ def require_aimdk_control_schema(types: _RosTypes) -> None:
         types.GetMcAction.Response: {"header", "info"},
         types.SetMcAction.Request: {"header", "source", "command"},
         types.SetMcAction.Response: {"response"},
+        types.GetCurrentInputSource.Request: {"request"},
+        types.GetCurrentInputSource.Response: {"response", "input_source"},
+        types.SetMcInputSource.Request: {"request", "action", "input_source"},
+        types.SetMcInputSource.Response: {"response"},
     }
     for message_type, required in service_schemas.items():
         actual = _fields(message_type)
@@ -239,13 +268,12 @@ def build_omnipicker_message(
 
     if side not in {"left", "right"}:
         raise HardwareContractError("OmniPicker side must be left or right")
+    require_installed_omnipicker_side(config, side)
     if not 0.0 <= position <= 1.0:
         raise HardwareContractError("OmniPicker position must be within [0, 1]")
     tuning = config.omnipicker
     command = types.HandCommand()
-    command.name = (
-        tuning.left_joint_name if side == "left" else tuning.right_joint_name
-    )
+    command.name = tuning.right_joint_name
     command.position = float(position)
     command.velocity = tuning.velocity
     command.acceleration = tuning.acceleration
@@ -256,14 +284,9 @@ def build_omnipicker_message(
     # 0 means no command/device for this message; 2 means OmniPicker/gripper.
     message.left_hand_type = types.HandType(value=0)
     message.right_hand_type = types.HandType(value=0)
-    if side == "left":
-        message.left_hand_type = types.HandType(value=2)
-        message.left_hands = [command]
-        message.right_hands = []
-    else:
-        message.right_hand_type = types.HandType(value=2)
-        message.right_hands = [command]
-        message.left_hands = []
+    message.right_hand_type = types.HandType(value=2)
+    message.right_hands = [command]
+    message.left_hands = []
     return message
 
 
@@ -332,6 +355,40 @@ def _response_message(response: object) -> str:
     if common is None:
         return "missing CommonResponse"
     return str(getattr(common, "message", "unknown service error"))
+
+
+def _largest_tracking_error(
+    feedback: Sequence[float],
+    index_by_name: Mapping[str, int],
+    targets: Mapping[str, float],
+) -> tuple[float, str, float, float]:
+    """Return error, joint name, feedback and target for the worst joint."""
+
+    if not targets:
+        raise HardwareContractError("tracking targets must not be empty")
+    joint_name, target = max(
+        targets.items(),
+        key=lambda item: abs(
+            feedback[index_by_name[item[0]]] - float(item[1])
+        ),
+    )
+    actual = float(feedback[index_by_name[joint_name]])
+    expected = float(target)
+    return abs(actual - expected), joint_name, actual, expected
+
+
+def _wait_for_control_services(
+    required: Sequence[tuple[object, str]],
+    timeout_s: float,
+) -> None:
+    """Give every required DDS service its own complete discovery window."""
+
+    for client, name in required:
+        if not client.wait_for_service(timeout_sec=timeout_s):
+            raise LiveHardwareError(
+                "AimDK control service is unavailable after "
+                f"{timeout_s:.1f} s: {name}"
+            )
 
 
 def create_aimdk_hardware_node(
@@ -406,6 +463,14 @@ def create_aimdk_hardware_node(
             self.set_mode_client = self.create_client(
                 types.SetMcAction, config.services.set_mc_action
             )
+            self.get_input_source_client = self.create_client(
+                types.GetCurrentInputSource,
+                config.services.get_current_input_source,
+            )
+            self.set_input_source_client = self.create_client(
+                types.SetMcInputSource,
+                config.services.set_mc_input_source,
+            )
             for group, topic in (
                 ("arm", topics.arm_state),
                 ("waist", topics.waist_state),
@@ -456,18 +521,26 @@ def create_aimdk_hardware_node(
                 )
 
         def _wait_for_mode_services(self) -> None:
-            deadline = time.monotonic() + config.upper_body.feedback_timeout_s
-            for client, name in (
-                (self.get_mode_client, config.services.get_mc_action),
-                (self.set_mode_client, config.services.set_mc_action),
-            ):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0.0 or not client.wait_for_service(
-                    timeout_sec=remaining
-                ):
-                    raise LiveHardwareError(
-                        f"AimDK mode service is unavailable: {name}"
-                    )
+            # DDS endpoint discovery is independent of joint-state feedback.
+            # Give every required service a complete discovery window: sharing
+            # the 2 s feedback deadline made the last client fail intermittently
+            # while a fresh participant was still discovering MC endpoints.
+            timeout = config.upper_body.service_discovery_timeout_s
+            _wait_for_control_services(
+                (
+                    (self.get_mode_client, config.services.get_mc_action),
+                    (self.set_mode_client, config.services.set_mc_action),
+                    (
+                        self.get_input_source_client,
+                        config.services.get_current_input_source,
+                    ),
+                    (
+                        self.set_input_source_client,
+                        config.services.set_mc_input_source,
+                    ),
+                ),
+                timeout,
+            )
 
         def _call_service(self, client: object, request: object, label: str):
             latest_error = ""
@@ -520,6 +593,82 @@ def create_aimdk_hardware_node(
                     f"{_response_message(response)}"
                 )
 
+        def get_input_source(self) -> tuple[str, int, int]:
+            request = types.GetCurrentInputSource.Request()
+            request.request = types.CommonRequest()
+            request.request.header.stamp = self.get_clock().now().to_msg()
+            response = self._call_service(
+                self.get_input_source_client,
+                request,
+                "GetCurrentInputSource",
+            )
+            if not _response_success(response):
+                raise LiveHardwareError(
+                    "GetCurrentInputSource was rejected: "
+                    f"{_response_message(response)}"
+                )
+            source = response.input_source
+            return (
+                str(source.name),
+                int(source.priority),
+                int(source.timeout),
+            )
+
+        def _set_input_source(self, action: int, label: str) -> bool:
+            request = types.SetMcInputSource.Request()
+            request.request = types.CommonRequest()
+            request.request.header.stamp = self.get_clock().now().to_msg()
+            request.action = types.McInputAction()
+            request.action.value = int(action)
+            request.input_source = types.McInputSource()
+            request.input_source.name = config.upper_body.command_source
+            request.input_source.priority = (
+                config.upper_body.command_source_priority
+            )
+            request.input_source.timeout = (
+                config.upper_body.command_source_timeout_ms
+            )
+            response = self._call_service(
+                self.set_input_source_client,
+                request,
+                f"SetMcInputSource({label})",
+            )
+            return _response_success(response)
+
+        def configure_input_source(self) -> None:
+            """Register an independent source without overriding RC or VR."""
+
+            # ADD is idempotent only at the policy level: an already registered
+            # source is expected to reject ADD, after which MODIFY refreshes its
+            # priority/timeout. Registration state resets when MC restarts.
+            if not self._set_input_source(
+                types.McInputAction.INPUTACTION_ADD,
+                "ADD",
+            ):
+                if not self._set_input_source(
+                    types.McInputAction.INPUTACTION_MODIFY,
+                    "MODIFY",
+                ):
+                    raise LiveHardwareError(
+                        "MC rejected both ADD and MODIFY for input source "
+                        f"{config.upper_body.command_source!r}"
+                    )
+            if not self._set_input_source(
+                types.McInputAction.INPUTACTION_ENABLE,
+                "ENABLE",
+            ):
+                self.get_logger().warning(
+                    "MC rejected ENABLE for input source "
+                    f"{config.upper_body.command_source!r}; activation check "
+                    "will determine whether it is already enabled"
+                )
+            self.get_logger().info(
+                "MC input source configured: "
+                f"name={config.upper_body.command_source!r}, "
+                f"priority={config.upper_body.command_source_priority}, "
+                f"timeout={config.upper_body.command_source_timeout_ms} ms"
+            )
+
         def _wait_for_mode(self, expected: str) -> None:
             deadline = time.monotonic() + config.upper_body.mode_timeout_s
             latest = ("", -1)
@@ -555,6 +704,72 @@ def create_aimdk_hardware_node(
             # Restore stable mode even when status confirmation later times out.
             self.split_mode_entered = True
             self._wait_for_mode(config.upper_body.split_mode)
+
+        def _activate_input_source(
+            self,
+            profile: RobotProfile,
+            arm: Sequence[float],
+            head: tuple[float, float],
+        ) -> None:
+            """Hold the live pose until MC selects graspV2's command source."""
+
+            frame = UpperBodyFrame(
+                head_positions=head,
+                arm_positions=upper_body_arm_positions(profile, arm),
+            )
+            period = 1.0 / config.upper_body.command_rate_hz
+            deadline = time.monotonic() + config.upper_body.feedback_timeout_s
+            future = None
+            request_started = 0.0
+            latest = ("", -1, -1)
+            while time.monotonic() < deadline:
+                cycle = time.monotonic()
+                self.command_upper_body(frame)
+                rclpy.spin_once(self, timeout_sec=min(0.005, period))
+
+                if future is None:
+                    request = types.GetCurrentInputSource.Request()
+                    request.request = types.CommonRequest()
+                    request.request.header.stamp = (
+                        self.get_clock().now().to_msg()
+                    )
+                    future = self.get_input_source_client.call_async(request)
+                    request_started = time.monotonic()
+                elif future.done() and not future.cancelled():
+                    error = future.exception()
+                    response = None if error is not None else future.result()
+                    if response is not None and _response_success(response):
+                        source = response.input_source
+                        latest = (
+                            str(source.name),
+                            int(source.priority),
+                            int(source.timeout),
+                        )
+                        if latest[0] == config.upper_body.command_source:
+                            self.get_logger().info(
+                                "MC selected input source "
+                                f"{latest[0]!r} at priority {latest[1]}"
+                            )
+                            return
+                    future = None
+                elif (
+                    time.monotonic() - request_started
+                    > config.upper_body.service_timeout_s
+                ):
+                    future.cancel()
+                    future = None
+
+                remaining = period - (time.monotonic() - cycle)
+                if remaining > 0.0:
+                    time.sleep(remaining)
+
+            if future is not None and not future.done():
+                future.cancel()
+            raise LiveHardwareError(
+                "MC did not grant upper-body control to input source "
+                f"{config.upper_body.command_source!r}; current source is "
+                f"{latest[0]!r} at priority {latest[1]}"
+            )
 
         def restore_stable_mode(self) -> None:
             if not self.split_mode_entered:
@@ -650,7 +865,11 @@ def create_aimdk_hardware_node(
             if state is None:
                 state = self._wait_for_state("hand")
             self._assert_fresh("hand")
-            sides = (side,) if side is not None else ("left", "right")
+            sides = (
+                (side,)
+                if side is not None
+                else (config.omnipicker.installed_side,)
+            )
             for selected in sides:
                 hand_type = int(getattr(state, f"{selected}_hand_type").value)
                 if hand_type != 2:
@@ -699,9 +918,12 @@ def create_aimdk_hardware_node(
                     head = self._assert_head_health()
                     self._wait_for_mode_services()
                     mode, status = self.get_mode()
+                    source = self.get_input_source()
                     self.get_logger().info(
                         f"MC upper-body interface ready: {len(positions)} arm "
                         f"joints, head={head}, current mode={mode!r}/{status}; "
+                        f"input source={source[0]!r}/{source[1]}/"
+                        f"{source[2]} ms; "
                         "preflight does not change mode"
                     )
                 else:
@@ -794,9 +1016,11 @@ def create_aimdk_hardware_node(
             head = self._assert_head_health()
             self._validate_upper_body_start(profile, trajectory, base)
             self._require_stable_mode()
+            self.configure_input_source()
             try:
                 self._enter_split_mode()
                 self._wait_for_command_consumer("upper-body")
+                self._activate_input_source(profile, base, head)
                 self._run_upper_body_trajectory(
                     profile,
                     trajectory,
@@ -882,13 +1106,22 @@ def create_aimdk_hardware_node(
                 )
                 self._assert_head_health()
                 if target_time >= min(0.50, trajectory.duration):
-                    tracking_error = max(
-                        abs(feedback[index_by_name[name]] - positions[name])
-                        for name in positions
+                    (
+                        tracking_error,
+                        tracking_joint,
+                        tracking_actual,
+                        tracking_target,
+                    ) = _largest_tracking_error(
+                        feedback,
+                        index_by_name,
+                        positions,
                     )
                     if tracking_error > config.upper_body.maximum_tracking_error_rad:
                         raise LiveHardwareError(
-                            f"arm tracking error {tracking_error:.3f} rad exceeds "
+                            f"arm tracking error {tracking_error:.3f} rad on "
+                            f"{tracking_joint} at trajectory t={target_time:.3f} s "
+                            f"(actual={tracking_actual:.3f}, "
+                            f"target={tracking_target:.3f}) exceeds "
                             f"{config.upper_body.maximum_tracking_error_rad:.3f}"
                         )
                 if target_time >= trajectory.duration:
@@ -1009,17 +1242,14 @@ def create_aimdk_hardware_node(
             """Execute open/approach/close/check/lift/check/release/return."""
 
             validate_trajectory_continuity(approach, lift)
+            require_installed_omnipicker_side(config, metadata.side)
             if metadata.robot_profile != profile.name:
                 raise LiveHardwareError(
                     f"grasp plan is for {metadata.robot_profile}, not {profile.name}"
                 )
             if verification_timeout_s <= 0.0:
                 raise ValueError("verification_timeout_s must be positive")
-            expected_joints = set(
-                profile.left_arm_joints
-                if metadata.side == "left"
-                else profile.right_arm_joints
-            )
+            expected_joints = set(profile.right_arm_joints)
             if set(approach.joint_names) != expected_joints:
                 raise LiveHardwareError(
                     "grasp trajectories do not command exactly the selected arm"
@@ -1031,6 +1261,7 @@ def create_aimdk_hardware_node(
             head = self._assert_head_health()
             self._validate_upper_body_start(profile, approach, base)
             self._require_stable_mode()
+            self.configure_input_source()
             # Open before changing MC mode, following the competition hand contract.
             self.execute_omnipicker(
                 metadata.side,
@@ -1048,6 +1279,7 @@ def create_aimdk_hardware_node(
             try:
                 self._enter_split_mode()
                 self._wait_for_command_consumer("upper-body")
+                self._activate_input_source(profile, base, head)
                 approach_frame = self._run_upper_body_trajectory(
                     profile,
                     approach,
@@ -1176,13 +1408,22 @@ def create_aimdk_hardware_node(
                     profile, require_stationary=False
                 )
                 if target_time >= min(0.50, trajectory.duration):
-                    tracking_error = max(
-                        abs(feedback[index_by_name[name]] - positions[name])
-                        for name in positions
+                    (
+                        tracking_error,
+                        tracking_joint,
+                        tracking_actual,
+                        tracking_target,
+                    ) = _largest_tracking_error(
+                        feedback,
+                        index_by_name,
+                        positions,
                     )
                     if tracking_error > config.upper_body.maximum_tracking_error_rad:
                         raise LiveHardwareError(
-                            f"arm tracking error {tracking_error:.3f} rad exceeds "
+                            f"arm tracking error {tracking_error:.3f} rad on "
+                            f"{tracking_joint} at trajectory t={target_time:.3f} s "
+                            f"(actual={tracking_actual:.3f}, "
+                            f"target={tracking_target:.3f}) exceeds "
                             f"{config.upper_body.maximum_tracking_error_rad:.3f}"
                         )
                 if target_time >= trajectory.duration:
@@ -1251,7 +1492,7 @@ def _parser() -> argparse.ArgumentParser:
     trajectory = subparsers.add_parser(
         "trajectory", help="validate or directly publish a planned arm trajectory"
     )
-    trajectory.add_argument("--robot", choices=tuple(PROFILES), required=True)
+    trajectory.add_argument("--robot", choices=tuple(PROFILES), default="ultra")
     trajectory.add_argument("--trajectory", type=Path, required=True)
     trajectory.add_argument(
         "--transport",
@@ -1265,7 +1506,12 @@ def _parser() -> argparse.ArgumentParser:
     hand = subparsers.add_parser(
         "omnipicker", help="validate or command one OmniPicker"
     )
-    hand.add_argument("--side", choices=("left", "right"), required=True)
+    hand.add_argument(
+        "--side",
+        choices=AVAILABLE_GRIPPER_SIDES,
+        default=INSTALLED_GRIPPER_SIDE,
+        help="compatibility option; the installed OmniPicker is fixed on the right",
+    )
     target = hand.add_mutually_exclusive_group(required=True)
     target.add_argument("--action", choices=("open", "close"))
     target.add_argument("--position", type=float)
@@ -1276,7 +1522,7 @@ def _parser() -> argparse.ArgumentParser:
         "grasp",
         help="execute a visually verified approach/close/two-second-lift sequence",
     )
-    grasp.add_argument("--robot", choices=tuple(PROFILES), required=True)
+    grasp.add_argument("--robot", choices=tuple(PROFILES), default="ultra")
     grasp.add_argument("--approach-trajectory", type=Path, required=True)
     grasp.add_argument("--lift-trajectory", type=Path, required=True)
     grasp.add_argument("--initial-vision", type=Path, required=True)
@@ -1488,7 +1734,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         position: float | None = None
         if args.operation in {"preflight", "trajectory", "grasp"}:
             profile = get_robot_profile(args.robot)
-            profile.assert_planning_enabled()
         if args.operation == "trajectory":
             _require_execution_confirmation(args)
             assert profile is not None
@@ -1536,6 +1781,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.approach_trajectory,
                 args.lift_trajectory,
             )
+            require_installed_omnipicker_side(config, grasp_metadata.side)
             if grasp_metadata.robot_profile != profile.name:
                 raise HardwareContractError(
                     f"grasp plan is for {grasp_metadata.robot_profile}, "
@@ -1594,6 +1840,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     types = None
     try:
         types = _load_ros_types()
+        configure_fastdds_logging()
         types.rclpy.init(args=[])
         node = create_aimdk_hardware_node(types, config)
         if args.operation == "preflight":

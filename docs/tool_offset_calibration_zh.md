@@ -8,7 +8,8 @@
 config/tool_pose_offset.json
 ```
 
-左右手独立配置：
+比赛机只有右手安装 OmniPicker，因此只标定 `right`。`left` 项是官方双臂运动学模型要求的
+兼容占位，必须保留全零，抓取规划和真机夹爪命令不会使用它：
 
 ```json
 {
@@ -65,8 +66,8 @@ p_world_tcp = p_world_base + R_world_base × [dx, dy, dz]
 规划目标仍然是视觉给出的物体抓取点。增加 TCP 平移后，IK 会自动反算 OmniPicker
 基座应该移动到哪里，使配置后的真实 TCP 到达同一个物体点；不要再手工移动视觉目标。
 
-左右 OmniPicker 基座在官方 URDF 中各自带固定旋转，因此不要仅凭世界坐标把一侧数值
-取负复制到另一侧。应分别在各自局部坐标系中测量，或根据 CAD 的左右手变换填写。
+右侧 OmniPicker 基座在官方 URDF 中带固定旋转，因此必须在它自己的局部坐标系中测量，
+不能直接把世界坐标位移填入配置。
 
 ## 3. rpy_rad 对应什么
 
@@ -93,10 +94,10 @@ p_world_tcp = p_world_base + R_world_base × [dx, dy, dz]
 
 ## 4. 推荐标定流程
 
-1. 将左右 `translation_m` 和 `rpy_rad` 暂时设为全零并保存原文件。
+1. 将右侧 `translation_m` 和 `rpy_rad` 暂时设为全零并保存原文件；左侧占位项保持全零。
 2. 在 CAD 中读取，或使用直尺/标定尖点测量 OmniPicker 基座原点到实际夹持中心的
    局部 XYZ 距离。
-3. 只修改一侧，先以 1～5 mm 的增量验证；不要同时修改相机外参。
+3. 只修改 `right`，先以 1～5 mm 的增量验证；不要同时修改相机外参。
 4. 运行仿真：
 
    ```bash
@@ -111,7 +112,7 @@ p_world_tcp = p_world_base + R_world_base × [dx, dy, dz]
    ```
 
    其中 `active_tcp_offset` 必须与刚填写的值一致。
-6. 左手完成后再独立标定右手。最后使用一个已知世界坐标的标定点做实机低速验证。
+6. 最后使用一个已知世界坐标的标定点做右手实机低速验证。
 
 若观察到整个桌子、物体和抓取点一起偏移，应调整
 `config/mujoco_camera_calibration.json` 的相机外参/全局点偏移；若只有夹爪实际抓取中心
@@ -122,8 +123,8 @@ p_world_tcp = p_world_base + R_world_base × [dx, dy, dz]
 - 每个平移分量的配置保护上限为 0.50 m；
 - 每个旋转分量的保护上限为 `2π`；
 - JSON 必须包含三个有限数值；
-- `parent_frame` 必须保持为对应的 `L_omnipicker_base_link` 或
-  `R_omnipicker_base_link`。
+- `right.parent_frame` 必须保持为 `R_omnipicker_base_link`；左侧兼容占位仍保留
+  `L_omnipicker_base_link` 和全零偏移。
 
 恢复默认行为：
 

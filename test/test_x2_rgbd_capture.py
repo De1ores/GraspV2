@@ -6,7 +6,13 @@ from sensor_msgs.msg import CameraInfo
 
 pytest.importorskip("cv2")
 
-from vision.ros_rgbd_capture import align_depth_to_color, parse_args  # noqa: E402
+from vision.ros_rgbd_capture import (  # noqa: E402
+    _distortion,
+    _intrinsics,
+    align_depth_to_color,
+    parse_args,
+    rotate_rgbd_180,
+)
 
 
 def _camera_info(
@@ -32,6 +38,26 @@ def test_capture_defaults_to_official_x2_topics() -> None:
     assert args.depth_topic == "/aima/hal/sensor/rgbd_head_front/depth_image"
     assert args.camera_info_topic.endswith("/rgb_camera_info")
     assert args.depth_camera_info_topic.endswith("/depth_camera_info")
+    assert args.image_rotation_deg == 180
+
+
+def test_upside_down_capture_rotates_rgb_depth_and_calibration() -> None:
+    color = np.arange(12, dtype=np.uint8).reshape(2, 2, 3)
+    depth = np.array([[1, 2], [3, 4]], dtype=np.uint16)
+    rotated_color, rotated_depth = rotate_rgbd_180(color, depth)
+    np.testing.assert_array_equal(rotated_color, color[::-1, ::-1])
+    np.testing.assert_array_equal(rotated_depth, depth[::-1, ::-1])
+
+    camera = _camera_info(1280, 720, 688.0, 689.0, 641.5, 357.1)
+    camera.distortion_model = "plumb_bob"
+    camera.d = [0.01, -0.02, 0.003, -0.004, 0.005]
+    intrinsics = _intrinsics(camera, 180)
+    assert intrinsics["cx"] == pytest.approx(637.5)
+    assert intrinsics["cy"] == pytest.approx(361.9)
+    distortion = _distortion(camera, 180)
+    assert distortion["k1"] == pytest.approx(0.01)
+    assert distortion["p1"] == pytest.approx(-0.003)
+    assert distortion["p2"] == pytest.approx(0.004)
 
 
 def test_identity_registration_preserves_depth() -> None:

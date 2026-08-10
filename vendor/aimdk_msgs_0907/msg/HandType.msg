@@ -1,7 +1,0 @@
-uint8 value
-
-uint8 NONE=0x00
-uint8 NIMBLE_HANDS=0x01
-uint8 GRIPPER=0x02
-uint8 LEISAI_HANDS=0x03
-uint8 ERROR=0xFF

@@ -1,8 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Keep ROS system Python isolated from stale packages in ~/.local.  X2 images
+# are decoded by the OpenCV/NumPy pair installed with Ubuntu/AimDK.
+export PYTHONNOUSERSITE=1
+
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-vision_python="${GRASPV2_VISION_PYTHON:-$repo_dir/.venv/bin/python}"
+if [[ -x "$repo_dir/.vision-venv/bin/python" ]]; then
+  default_vision_python="$repo_dir/.vision-venv/bin/python"
+else
+  default_vision_python="$repo_dir/.venv/bin/python"
+fi
+vision_python="${GRASPV2_VISION_PYTHON:-$default_vision_python}"
+if [[ -d "$repo_dir/.runtime/cusparselt/lib" ]]; then
+  export LD_LIBRARY_PATH="$repo_dir/.runtime/cusparselt/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+cupti_lib="$repo_dir/.vision-venv/lib/python3.10/site-packages/nvidia/cuda_cupti/lib"
+if [[ -d "$cupti_lib" ]]; then
+  export LD_LIBRARY_PATH="$cupti_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 capture_backend="existing"
 capture_only=false
 output_dir="$repo_dir/output"
@@ -10,6 +26,7 @@ orbbec_binary="${GRASPV2_ORBBEC_CAPTURE:-$repo_dir/build/orbbec_capture}"
 capture_timeout="20"
 warmup_frames="10"
 depth_scale_m="0.001"
+image_rotation_deg="${GRASPV2_RGBD_ROTATION_DEG:-180}"
 hardware_config="$repo_dir/config/x2_aimdk_hardware.json"
 color_topic=""
 depth_topic=""
@@ -37,6 +54,7 @@ Capture options:
   --capture-timeout SEC          X2 topic timeout (default: 20).
   --warmup-frames N              X2 matched-frame warmup (default: 10).
   --depth-scale-m VALUE          X2 16UC1 metres/unit (default: 0.001).
+  --image-rotation-deg 0|180     Rotate aligned RGB-D (default: 180 for upside-down X2 camera).
   --orbbec-binary PATH           Manual SDK capture binary.
 
 All unrecognized options are forwarded to vision/yoloe_depth_target.py.
@@ -45,7 +63,7 @@ EOF
 
 while (($#)); do
   case "$1" in
-    --capture-backend|--output-dir|--hardware-config|--color-topic|--depth-topic|--rgb-camera-info-topic|--depth-camera-info-topic|--capture-timeout|--warmup-frames|--depth-scale-m|--orbbec-binary)
+    --capture-backend|--output-dir|--hardware-config|--color-topic|--depth-topic|--rgb-camera-info-topic|--depth-camera-info-topic|--capture-timeout|--warmup-frames|--depth-scale-m|--image-rotation-deg|--orbbec-binary)
       (($# >= 2)) || { echo "$1 requires a value" >&2; exit 2; }
       case "$1" in
         --capture-backend) capture_backend="$2" ;;
@@ -58,6 +76,7 @@ while (($#)); do
         --capture-timeout) capture_timeout="$2" ;;
         --warmup-frames) warmup_frames="$2" ;;
         --depth-scale-m) depth_scale_m="$2" ;;
+        --image-rotation-deg) image_rotation_deg="$2" ;;
         --orbbec-binary) orbbec_binary="$2" ;;
       esac
       shift 2
@@ -85,16 +104,18 @@ esac
 mkdir -p "$output_dir"
 case "$capture_backend" in
   x2-aimdk)
-    set +u
-    # shellcheck source=/dev/null
-    source /opt/ros/humble/setup.bash
-    set -u
+    if [[ "${GRASPV2_X2_ENV_READY:-0}" != "1" ]]; then
+      # Standalone X2 capture needs both ROS and the matching AimDK overlay.
+      # shellcheck source=/dev/null
+      source "$repo_dir/tools/setup_x2_mc_env.sh"
+    fi
     capture_args=(
       --hardware-config "$hardware_config"
       --output-dir "$output_dir"
       --timeout "$capture_timeout"
       --warmup-frames "$warmup_frames"
       --depth-scale-m "$depth_scale_m"
+      --image-rotation-deg "$image_rotation_deg"
     )
     [[ -z "$color_topic" ]] || capture_args+=(--color-topic "$color_topic")
     [[ -z "$depth_topic" ]] || capture_args+=(--depth-topic "$depth_topic")

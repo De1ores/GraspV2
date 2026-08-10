@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from graspv2 import cli
+from graspv2 import cli, simulation as simulation_module
 from graspv2.mc_animation import (
     DEFAULT_ARM_POSITION,
     MC_JOINT_ORDER,
@@ -14,27 +14,24 @@ from graspv2.mc_animation import (
 )
 from graspv2.official_ik import OfficialIK
 from graspv2.planner import plan_lift_trajectory, plan_trajectory
-from graspv2.robot_profiles import OPTIONAL_WRISTS, PROFILES
+from graspv2.robot_profiles import PROFILES
 from graspv2.simulation import (
     RobotSimulation,
     load_table_obstacle,
     resolve_robot_visual_urdf,
     validate_fk_alignment,
 )
-from graspv2.trajectory import load_trajectory
+from graspv2.trajectory import TrajectoryValidationError, load_trajectory
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "reachable_table.json"
 
 
-@pytest.mark.parametrize("profile_name,arm_dof", [("youth", 5), ("ultra", 7)])
-def test_official_sdk_and_mujoco_have_identical_kinematics(
-    profile_name: str, arm_dof: int
-) -> None:
-    profile = PROFILES[profile_name]
+def test_official_sdk_and_mujoco_have_identical_ultra_kinematics() -> None:
+    profile = PROFILES["ultra"]
     ik = OfficialIK(profile)
-    assert profile.arm_dof == arm_dof
-    assert len(ik.ready_arm_pos()) == arm_dof * 2
+    assert profile.arm_dof == 7
+    assert len(ik.ready_arm_pos()) == 14
     alignment = validate_fk_alignment(profile, ik, random_samples=5)
     assert alignment.maximum_position_error_m < 1e-9
     assert alignment.maximum_orientation_error_deg < 1e-4
@@ -43,7 +40,7 @@ def test_official_sdk_and_mujoco_have_identical_kinematics(
 
 
 def test_configured_tcp_pose_is_shared_by_ik_and_mujoco(tmp_path: Path) -> None:
-    profile = PROFILES["youth"]
+    profile = PROFILES["ultra"]
     calibration = {
         "schema_version": 1,
         "left": {
@@ -62,10 +59,18 @@ def test_configured_tcp_pose_is_shared_by_ik_and_mujoco(tmp_path: Path) -> None:
     base_ik = OfficialIK(profile)
     calibrated_ik = OfficialIK(profile, calibration_path)
     arm_pos = profile.mc_start_arm_pos()
-    assert np.linalg.norm(
+    observed_translation_delta = np.linalg.norm(
         np.asarray(calibrated_ik.fk_world("right", arm_pos))
         - np.asarray(base_ik.fk_world("right", arm_pos))
-    ) > 0.04
+    )
+    expected_translation_delta = np.linalg.norm(
+        np.asarray(calibration["right"]["translation_m"])
+        - np.asarray(base_ik.tool_pose.right.translation_m)
+    )
+    assert observed_translation_delta == pytest.approx(
+        expected_translation_delta, abs=1e-9
+    )
+    assert expected_translation_delta > 0.0
     simulation = RobotSimulation(profile, calibrated_ik)
     simulation.set_arm_pos(arm_pos)
     assert simulation.site_world_xyz("right") == pytest.approx(
@@ -78,11 +83,6 @@ def test_configured_tcp_pose_is_shared_by_ik_and_mujoco(tmp_path: Path) -> None:
     alignment = validate_fk_alignment(profile, calibrated_ik, random_samples=3)
     assert alignment.maximum_position_error_m < 1e-9
     assert alignment.maximum_orientation_error_deg < 1e-4
-
-
-def test_future_upper_profile_remains_safely_disabled() -> None:
-    with pytest.raises(RuntimeError, match="competition URDF"):
-        OfficialIK(PROFILES["future_upper"])
 
 
 def test_installed_physical_urdf_loads_full_body_visual_meshes() -> None:
@@ -101,19 +101,43 @@ def test_installed_physical_urdf_loads_full_body_visual_meshes() -> None:
     assert "actual_visual_pelvis_0" in simulation.xml
     assert "left_ankle_roll_link" in simulation.xml
     assert "right_ankle_roll_link" in simulation.xml
-    assert "actual_visual_L_omnipicker_base_link_0" in simulation.xml
+    assert "actual_visual_L_omnipicker_base_link_0" not in simulation.xml
     assert "actual_visual_R_omnipicker_base_link_0" in simulation.xml
-    assert "actual_visual_L_hand_narrow_loop_Link_0" in simulation.xml
+    assert "actual_visual_L_hand_narrow_loop_Link_0" not in simulation.xml
     assert "actual_visual_R_hand_wide_loop_Link_0" in simulation.xml
-    assert "actual_visual_left_wrist_roll_link_0" not in simulation.xml
     assert "actual_visual_right_wrist_roll_link_0" not in simulation.xml
-    assert "fist" not in simulation.xml.lower()
     assert "proxy_left_omnipicker" not in simulation.xml
     assert "proxy_right_omnipicker" not in simulation.xml
 
 
+def test_incomplete_auto_discovered_visual_urdf_uses_proxy_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broken = tmp_path / "x2_whole_body.urdf"
+    broken.write_text(
+        """<robot name="x2">
+  <link name="pelvis">
+    <visual><geometry><mesh filename="./meshes/pelvis.STL"/></geometry></visual>
+  </link>
+</robot>
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv(simulation_module.ROBOT_URDF_ENV, raising=False)
+    monkeypatch.setattr(
+        simulation_module,
+        "_robot_urdf_candidates",
+        lambda: (broken,),
+    )
+
+    assert simulation_module.resolve_robot_visual_urdf() is None
+    with pytest.raises(ValueError, match="robot visual mesh does not exist"):
+        simulation_module.resolve_robot_visual_urdf(broken)
+
+
 def test_scene_contains_floor_lighting_and_complete_visual_table() -> None:
-    profile = PROFILES["youth"]
+    profile = PROFILES["ultra"]
     _, obstacle = load_table_obstacle(FIXTURE)
     simulation = RobotSimulation(profile, OfficialIK(profile), obstacle)
     assert simulation.model.nlight == 2
@@ -139,7 +163,7 @@ def test_recognized_target_object_is_displayed_on_the_table(tmp_path: Path) -> N
     assert obstacle.target_object.geom_type == "cylinder"
     assert obstacle.target_object.center_m[2] == pytest.approx(0.9)
 
-    profile = PROFILES["youth"]
+    profile = PROFILES["ultra"]
     simulation = RobotSimulation(profile, OfficialIK(profile), obstacle)
     assert simulation.target_object_geom_id >= 0
     assert 'name="recognized_target_object"' in simulation.xml
@@ -148,11 +172,8 @@ def test_recognized_target_object_is_displayed_on_the_table(tmp_path: Path) -> N
     assert simulation.model.geom_conaffinity[target_geom] == 0
 
 
-@pytest.mark.parametrize("profile_name", ["youth", "ultra"])
-def test_table_plan_is_verified_and_loadable(
-    profile_name: str, tmp_path: Path
-) -> None:
-    profile = PROFILES[profile_name]
+def test_table_plan_is_verified_and_loadable(tmp_path: Path) -> None:
+    profile = PROFILES["ultra"]
     result = plan_trajectory(profile, vision_result=FIXTURE)
     assert result.obstacle is not None
     assert result.report["ik_backend"] == "x2_ik_sdk.X2ArmIKSolver"
@@ -169,7 +190,7 @@ def test_table_plan_is_verified_and_loadable(
     assert loaded.joint_names == profile.right_arm_joints
     assert loaded.frame_count == len(result.times)
     document = json.loads(trajectory_path.read_text(encoding="utf-8"))
-    assert document["robot_profile"] == profile_name
+    assert document["robot_profile"] == "ultra"
     assert document["planning"]["table_obstacle"]["center_m"] == pytest.approx(
         result.obstacle.center_m
     )
@@ -184,40 +205,72 @@ def test_cli_uses_latest_vision_result_unless_explicitly_disabled(
     default_args = cli._parser().parse_args([])
     assert cli._resolve_vision_result(default_args) == latest
     assert default_args.headless is False
-    assert default_args.side == "auto"
+    assert default_args.side == "right"
     no_vision_args = cli._parser().parse_args(["--no-vision"])
     assert cli._resolve_vision_result(no_vision_args) is None
     headless_args = cli._parser().parse_args(["--headless"])
     assert headless_args.headless is True
 
 
-def test_default_auto_side_retries_the_other_arm(
+def test_right_only_planning_never_falls_back_to_left(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     args = cli._parser().parse_args(["--no-vision"])
-    selected = object()
     attempts: list[str] = []
 
     def fake_plan(profile, *, side, **kwargs):
         attempts.append(side)
-        if side == "right":
-            raise RuntimeError("right target unreachable")
-        return selected
+        raise RuntimeError("right target unreachable")
 
     monkeypatch.setattr(cli, "plan_trajectory", fake_plan)
-    result = cli._plan_with_side_fallback(args, PROFILES["youth"], None)
-    assert result is selected
-    assert attempts == ["right", "left"]
+    with pytest.raises(RuntimeError, match="right target unreachable"):
+        cli._plan_with_installed_gripper(args, PROFILES["ultra"], None)
+    assert attempts == ["right"]
 
 
-def test_auto_side_prefers_the_target_half_space() -> None:
+def test_grasp_side_is_right_even_for_a_left_half_space_target() -> None:
     parser = cli._parser()
     left_target = parser.parse_args(["--target", "0.5", "0.2", "0.9"])
     right_target = parser.parse_args(["--target", "0.5", "-0.2", "0.9"])
-    assert cli._automatic_side_order(left_target, None) == ("left", "right")
-    assert cli._automatic_side_order(right_target, None) == ("right", "left")
+    assert cli._grasp_side(left_target) == "right"
+    assert cli._grasp_side(right_target) == "right"
     forced = parser.parse_args(["--side", "right"])
-    assert cli._automatic_side_order(forced, None) == ("right",)
+    assert cli._grasp_side(forced) == "right"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--side", "left"])
+
+
+def test_direct_left_grasp_plan_is_rejected() -> None:
+    with pytest.raises(ValueError, match="no left OmniPicker"):
+        plan_trajectory(PROFILES["ultra"], side="left")
+
+
+def test_existing_left_arm_trajectory_cannot_enter_grasp_playback(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "left_trajectory.json"
+    path.write_text(
+        json.dumps(
+            {
+                "robot_profile": "ultra",
+                "arm_side": "left",
+                "planning": {
+                    "verified_collision_free": True,
+                    "ik_backend": "x2_ik_sdk.X2ArmIKSolver",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(TrajectoryValidationError, match="no left OmniPicker"):
+        cli._validate_trajectory_profile(path, PROFILES["ultra"])
+
+
+def test_mujoco_scene_contains_only_the_installed_right_omnipicker() -> None:
+    profile = PROFILES["ultra"]
+    simulation = RobotSimulation(profile, OfficialIK(profile))
+    assert "actual_visual_R_omnipicker_base_link_0" in simulation.xml
+    assert "actual_visual_L_omnipicker_base_link_0" not in simulation.xml
 
 
 def test_sim_opens_viewer_by_default_and_headless_skips_it(
@@ -249,16 +302,16 @@ def test_failed_plan_still_opens_default_static_scene(
     monkeypatch.setattr(cli, "_resolve_vision_result", lambda args: FIXTURE)
     monkeypatch.setattr(cli, "preview_scene", record_preview)
     assert cli.main([]) == 1
-    assert previewed == [(PROFILES["youth"], FIXTURE)]
+    assert previewed == [(PROFILES["ultra"], FIXTURE)]
     previewed.clear()
     assert cli.main(["--headless"]) == 1
     assert previewed == []
 
 
-def test_youth_animation_keeps_absent_wrist_columns_fixed(tmp_path: Path) -> None:
-    profile = PROFILES["youth"]
+def test_ultra_animation_uses_the_14_joint_arm_layout(tmp_path: Path) -> None:
+    profile = PROFILES["ultra"]
     result = plan_trajectory(profile)
-    trajectory_path = tmp_path / "youth.json"
+    trajectory_path = tmp_path / "ultra.json"
     result.write(trajectory_path, tmp_path / "report.json")
     trajectory = load_trajectory(trajectory_path)
     animation = build_mc_animation(
@@ -274,14 +327,13 @@ def test_youth_animation_keeps_absent_wrist_columns_fixed(tmp_path: Path) -> Non
     assert all(
         row[4:18] == pytest.approx(DEFAULT_ARM_POSITION) for row in lead_in_rows
     )
-    defaults = dict(zip(MC_JOINT_ORDER[3:17], DEFAULT_ARM_POSITION))
-    for joint_name in OPTIONAL_WRISTS:
-        column = 1 + MC_JOINT_ORDER.index(joint_name)
-        assert all(row[column] == pytest.approx(defaults[joint_name]) for row in animation.rows)
+    assert len(profile.arm_pos_order) == 14
+    assert set(trajectory.joint_names) == set(profile.right_arm_joints)
+    assert all(len(row) == len(MC_JOINT_ORDER) + 1 for row in animation.rows)
 
 
 def test_clearance_gate_rejects_same_path_at_stricter_threshold() -> None:
-    profile = PROFILES["youth"]
+    profile = PROFILES["ultra"]
     baseline = plan_trajectory(
         profile,
         vision_result=FIXTURE,
@@ -316,7 +368,7 @@ def test_clearance_gate_rejects_same_path_at_stricter_threshold() -> None:
 
 def test_lift_plan_starts_at_grasp_and_runs_for_two_seconds() -> None:
     approach = plan_trajectory(
-        PROFILES["youth"],
+        PROFILES["ultra"],
         vision_result=FIXTURE,
         table_clearance_m=0.025,
     )

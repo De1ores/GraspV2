@@ -1,5 +1,0 @@
-int32 value
-
-int32 IDLE = 0
-int32 RUNNING = 100
-int32 TRANSITION = 200

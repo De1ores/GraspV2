@@ -1,3 +1,0 @@
-McAction current_action
-string action_desc
-McActionStatus status

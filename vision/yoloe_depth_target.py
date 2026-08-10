@@ -32,18 +32,12 @@ from ultralytics import YOLO  # noqa: E402
 
 
 DEFAULT_CLASSES = [
-    "bottle",
     "cup",
-    "mug",
-    "bowl",
-    "box",
-    "can",
-    "remote control",
-    "screwdriver",
-    "keyboard",
-    "game controller",
-    "pen",
+    "orange-capped pill bottle",
+    "bag of corn bread",
 ]
+
+MINIMUM_OBJECT_DEPTH_PIXELS = 30
 
 
 def parse_args() -> argparse.Namespace:
@@ -141,13 +135,42 @@ def select_detection(detections: list[dict[str, Any]], args: argparse.Namespace)
     if args.detection_index is not None:
         if not 0 <= args.detection_index < len(detections):
             raise ValueError(f"--detection-index must be in [0, {len(detections) - 1}]")
+        requested = detections[args.detection_index]
+        candidate_filter = requested.get("candidate_filter", {})
+        if not candidate_filter.get("accepted", True):
+            reasons = candidate_filter.get("rejection_reasons", ["unknown reason"])
+            raise RuntimeError(
+                f"Detection #{args.detection_index} is outside the safe tabletop target region: "
+                + ", ".join(str(reason) for reason in reasons)
+            )
         return args.detection_index
-    candidates = detections
+    class_candidates = detections
     if args.target_class:
-        candidates = [item for item in detections if item["class_name"].casefold() == args.target_class.casefold()]
-        if not candidates:
+        class_candidates = [
+            item
+            for item in detections
+            if item["class_name"].casefold() == args.target_class.casefold()
+        ]
+        if not class_candidates:
             found = sorted({item["class_name"] for item in detections})
             raise RuntimeError(f"No '{args.target_class}' detected; found: {found}")
+    candidates = [
+        item
+        for item in class_candidates
+        if item.get("candidate_filter", {}).get("accepted", True)
+    ]
+    if not candidates:
+        rejected = {
+            int(item["index"]): item.get("candidate_filter", {}).get(
+                "rejection_reasons", ["unknown reason"]
+            )
+            for item in class_candidates
+        }
+        requested = f" for class '{args.target_class}'" if args.target_class else ""
+        raise RuntimeError(
+            f"No YOLOE detections{requested} passed the tabletop candidate filter; "
+            f"rejected: {rejected}"
+        )
     return int(max(candidates, key=lambda item: item["confidence"])["index"])
 
 
@@ -609,6 +632,230 @@ def project_mujoco_points_to_image(
     return projected.reshape(-1, 2)
 
 
+def mask_centroid_uv(instance_mask: np.ndarray) -> np.ndarray:
+    moments = cv2.moments(instance_mask, binaryImage=True)
+    if moments["m00"] <= 0.0:
+        raise RuntimeError("Instance segmentation mask is empty")
+    return np.array(
+        [moments["m10"] / moments["m00"], moments["m01"] / moments["m00"]],
+        dtype=np.float64,
+    )
+
+
+def analyze_instance_depth(
+    instance_mask: np.ndarray,
+    depth_raw: np.ndarray,
+    depth_m: np.ndarray,
+    camera: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Extract robust object depth once so filtering and final grasp use the same point."""
+    if instance_mask.shape != depth_raw.shape:
+        raise ValueError(
+            f"Instance/depth shape mismatch: {instance_mask.shape} vs {depth_raw.shape}"
+        )
+    binary_mask = instance_mask > 0
+    if args.mask_erode_px > 0:
+        kernel_size = args.mask_erode_px * 2 + 1
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+        )
+        inner_mask = cv2.erode(instance_mask, kernel) > 0
+        if np.count_nonzero(inner_mask) < MINIMUM_OBJECT_DEPTH_PIXELS:
+            inner_mask = binary_mask
+    else:
+        inner_mask = binary_mask
+
+    inner_pixel_count = int(np.count_nonzero(inner_mask))
+    valid = (
+        inner_mask
+        & (depth_raw > 0)
+        & (depth_m >= args.min_depth_m)
+        & (depth_m <= args.max_depth_m)
+    )
+    raw_valid_pixel_count = int(np.count_nonzero(valid))
+    rows, cols = np.nonzero(valid)
+    if len(rows) < MINIMUM_OBJECT_DEPTH_PIXELS:
+        raise RuntimeError(
+            f"Only {len(rows)} valid depth pixels inside the instance mask"
+        )
+
+    depths = depth_m[rows, cols]
+    median_depth = float(np.median(depths))
+    mad = float(np.median(np.abs(depths - median_depth)))
+    depth_p05, depth_p95 = [float(value) for value in np.percentile(depths, [5, 95])]
+    depth_spread = depth_p95 - depth_p05
+    valid_depth_fraction = raw_valid_pixel_count / max(inner_pixel_count, 1)
+    quality_warnings: list[str] = []
+    if valid_depth_fraction < 0.75:
+        quality_warnings.append(
+            "Less than 75% of the eroded mask has valid depth; "
+            "transparent/reflective material or occlusion is likely."
+        )
+    if depth_spread > 0.08:
+        quality_warnings.append(
+            "The 5th-to-95th percentile depth spread exceeds 8 cm; "
+            "the mask may contain multiple surfaces or see-through depth."
+        )
+    robust_sigma = 1.4826 * mad
+    band = max(args.min_depth_band_m, args.mad_multiplier * robust_sigma)
+    inlier = np.abs(depths - median_depth) <= band
+    rows, cols, depths = rows[inlier], cols[inlier], depths[inlier]
+    if len(rows) < MINIMUM_OBJECT_DEPTH_PIXELS:
+        raise RuntimeError(
+            f"Only {len(rows)} depth inliers remain after robust filtering"
+        )
+
+    pixels_uv = np.column_stack((cols, rows)).astype(np.float64)
+    rays, deprojection_method = pixels_to_rays(
+        pixels_uv,
+        camera["color"]["intrinsics"],
+        camera["color"]["distortion"],
+    )
+    points_camera = rays * depths[:, None]
+    mask_center_uv = mask_centroid_uv(instance_mask)
+    center_index = int(
+        np.argmin(np.sum((pixels_uv - mask_center_uv) ** 2, axis=1))
+    )
+    surface_uv = pixels_uv[center_index]
+    surface_point = points_camera[center_index]
+    return {
+        "binary_mask": binary_mask,
+        "inner_mask": inner_mask,
+        "inner_pixel_count": inner_pixel_count,
+        "raw_valid_pixel_count": raw_valid_pixel_count,
+        "valid_depth_fraction": valid_depth_fraction,
+        "median_depth_m": median_depth,
+        "mad_m": mad,
+        "depth_p05_m": depth_p05,
+        "depth_p95_m": depth_p95,
+        "depth_spread_m": depth_spread,
+        "accepted_half_band_m": band,
+        "quality_warnings": quality_warnings,
+        "pixels_uv": pixels_uv,
+        "points_camera": points_camera,
+        "mask_center_uv": mask_center_uv,
+        "surface_uv": surface_uv,
+        "surface_point_camera_m": surface_point,
+        "cloud_centroid_camera_m": np.median(points_camera, axis=0),
+        "deprojection_method": deprojection_method,
+    }
+
+
+def evaluate_detection_candidate(
+    instance_mask: np.ndarray | None,
+    depth_raw: np.ndarray,
+    depth_m: np.ndarray,
+    camera: dict[str, Any],
+    args: argparse.Namespace,
+    matrix: np.ndarray,
+    point_offset: np.ndarray,
+    table_result: dict[str, Any],
+    projected_table_corners: np.ndarray,
+    settings: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Require a mask center on the table and an object surface above its plane."""
+    minimum_height_m = float(settings.get("minimum_height_above_table_m", 0.01))
+    image_margin_px = float(settings.get("table_polygon_margin_px", 0.0))
+    footprint_margin_m = float(settings.get("table_footprint_margin_m", 0.0))
+    if minimum_height_m < 0.0 or image_margin_px < 0.0 or footprint_margin_m < 0.0:
+        raise ValueError("candidate_filter thresholds must be non-negative")
+
+    report: dict[str, Any] = {
+        "accepted": False,
+        "rejection_reasons": [],
+        "thresholds": {
+            "minimum_height_above_table_m": minimum_height_m,
+            "table_polygon_margin_px": image_margin_px,
+            "table_footprint_margin_m": footprint_margin_m,
+        },
+    }
+    if instance_mask is None:
+        report["rejection_reasons"].append("missing_segmentation_mask")
+        return report, None
+
+    try:
+        mask_center_uv = mask_centroid_uv(instance_mask)
+    except RuntimeError as error:
+        report["rejection_reasons"].append(f"invalid_segmentation_mask: {error}")
+        return report, None
+
+    polygon = np.asarray(projected_table_corners, dtype=np.float32).reshape(-1, 1, 2)
+    signed_image_distance_px = float(
+        cv2.pointPolygonTest(
+            polygon,
+            (float(mask_center_uv[0]), float(mask_center_uv[1])),
+            True,
+        )
+    )
+    center_inside_image = signed_image_distance_px >= image_margin_px
+    report.update(
+        {
+            "mask_center_uv": as_list(mask_center_uv, 2),
+            "table_polygon_signed_distance_px": round(signed_image_distance_px, 3),
+            "mask_center_inside_table_image_region": center_inside_image,
+        }
+    )
+    if not center_inside_image:
+        report["rejection_reasons"].append("mask_center_outside_table_image_region")
+        return report, None
+
+    try:
+        depth_analysis = analyze_instance_depth(
+            instance_mask, depth_raw, depth_m, camera, args
+        )
+    except (RuntimeError, TypeError, ValueError) as error:
+        report["rejection_reasons"].append(f"unusable_instance_depth: {error}")
+        return report, None
+
+    surface_mujoco = (
+        transform_point(matrix, depth_analysis["surface_point_camera_m"])
+        + point_offset
+    )
+    plane = table_result["plane_equation"]
+    table_normal = np.asarray(plane["normal_mujoco"], dtype=np.float64)
+    table_d = float(plane["d_m"])
+    height_above_table_m = float(np.dot(table_normal, surface_mujoco) + table_d)
+
+    table_transform = np.asarray(
+        table_result["T_mujoco_table_center"], dtype=np.float64
+    )
+    local_surface = table_transform[:3, :3].T @ (
+        surface_mujoco - table_transform[:3, 3]
+    )
+    half_size_xy = (
+        np.asarray(table_result["visible_extent"]["size_xy_m"], dtype=np.float64)
+        / 2.0
+    )
+    allowed_half_size_xy = half_size_xy - footprint_margin_m
+    if np.any(allowed_half_size_xy <= 0.0):
+        raise ValueError(
+            "candidate_filter.table_footprint_margin_m leaves no usable table area"
+        )
+    footprint_inside = bool(
+        np.all(np.abs(local_surface[:2]) <= allowed_half_size_xy)
+    )
+    above_table = height_above_table_m >= minimum_height_m
+    report.update(
+        {
+            "surface_pixel_uv": as_list(depth_analysis["surface_uv"], 2),
+            "surface_point_mujoco_m": as_list(surface_mujoco),
+            "height_above_table_m": round(height_above_table_m, 6),
+            "surface_projection_table_local_xy_m": as_list(local_surface[:2]),
+            "surface_projection_inside_table_footprint": footprint_inside,
+            "surface_above_table": above_table,
+        }
+    )
+    if not footprint_inside:
+        report["rejection_reasons"].append(
+            "surface_projection_outside_table_footprint"
+        )
+    if not above_table:
+        report["rejection_reasons"].append("surface_not_high_enough_above_table")
+    report["accepted"] = not report["rejection_reasons"]
+    return report, depth_analysis
+
+
 def main() -> None:
     args = parse_args()
     frame_dir = args.frame_dir.resolve()
@@ -619,7 +866,17 @@ def main() -> None:
     color_path = frame_dir / "color.png"
     depth_path = frame_dir / "depth.png"
     metadata_path = frame_dir / "camera.json"
-    for path in (color_path, depth_path, metadata_path, args.weights):
+    # YOLOE's class encoder otherwise calls Ultralytics' downloader from
+    # model.set_classes().  Requiring the bundled asset before model loading
+    # makes missing offline payloads fail closed on the robot.
+    text_encoder_path = ROOT / "mobileclip2_b.ts"
+    for path in (
+        color_path,
+        depth_path,
+        metadata_path,
+        args.weights,
+        text_encoder_path,
+    ):
         if not path.exists():
             raise FileNotFoundError(path)
 
@@ -655,7 +912,7 @@ def main() -> None:
     result = model.predict(**predict_args)[0]
 
     detections: list[dict[str, Any]] = []
-    masks: list[np.ndarray] = []
+    masks: list[np.ndarray | None] = []
     if result.boxes is not None:
         mask_tensor = result.masks.data.cpu().numpy() if result.masks is not None else None
         for index, box in enumerate(result.boxes.cpu()):
@@ -667,83 +924,15 @@ def main() -> None:
                 "confidence": round(float(box.conf.item()), 6),
                 "xyxy": [round(float(value), 2) for value in box.xyxy[0].tolist()],
             }
-            if mask_tensor is not None:
+            mask_u8: np.ndarray | None = None
+            if mask_tensor is not None and index < len(mask_tensor):
                 mask = mask_tensor[index]
                 if mask.shape != depth_raw.shape:
                     mask = cv2.resize(mask, (depth_raw.shape[1], depth_raw.shape[0]), interpolation=cv2.INTER_NEAREST)
                 mask_u8 = (mask > 0.5).astype(np.uint8) * 255
                 item["mask_pixel_count"] = int(np.count_nonzero(mask_u8))
-                masks.append(mask_u8)
+            masks.append(mask_u8)
             detections.append(item)
-
-    selected_index = select_detection(detections, args)
-    if not masks or selected_index >= len(masks):
-        raise RuntimeError("Selected YOLOE detection has no segmentation mask")
-    selected = detections[selected_index]
-    selected_mask = masks[selected_index]
-    selected_mask_path = output_dir / "selected_mask.png"
-    cv2.imwrite(str(selected_mask_path), selected_mask)
-    selected["mask_path"] = str(selected_mask_path)
-
-    binary_mask = selected_mask > 0
-    if args.mask_erode_px > 0:
-        kernel_size = args.mask_erode_px * 2 + 1
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-        inner_mask = cv2.erode(selected_mask, kernel) > 0
-        if np.count_nonzero(inner_mask) < 30:
-            inner_mask = binary_mask
-    else:
-        inner_mask = binary_mask
-
-    scale_m = float(camera["depth"]["scale_m_per_unit"])
-    depth_m = depth_raw.astype(np.float64) * scale_m
-    inner_pixel_count = int(np.count_nonzero(inner_mask))
-    valid = inner_mask & (depth_raw > 0) & (depth_m >= args.min_depth_m) & (depth_m <= args.max_depth_m)
-    raw_valid_pixel_count = int(np.count_nonzero(valid))
-    rows, cols = np.nonzero(valid)
-    if len(rows) < 30:
-        raise RuntimeError(f"Only {len(rows)} valid depth pixels inside selected mask")
-
-    depths = depth_m[rows, cols]
-    median_depth = float(np.median(depths))
-    mad = float(np.median(np.abs(depths - median_depth)))
-    depth_p05, depth_p95 = [float(value) for value in np.percentile(depths, [5, 95])]
-    depth_spread = depth_p95 - depth_p05
-    valid_depth_fraction = raw_valid_pixel_count / max(inner_pixel_count, 1)
-    quality_warnings: list[str] = []
-    if valid_depth_fraction < 0.75:
-        quality_warnings.append(
-            "Less than 75% of the eroded mask has valid depth; transparent/reflective material or occlusion is likely."
-        )
-    if depth_spread > 0.08:
-        quality_warnings.append(
-            "The 5th-to-95th percentile depth spread exceeds 8 cm; the mask may contain multiple surfaces or see-through depth."
-        )
-    robust_sigma = 1.4826 * mad
-    band = max(args.min_depth_band_m, args.mad_multiplier * robust_sigma)
-    inlier = np.abs(depths - median_depth) <= band
-    rows, cols, depths = rows[inlier], cols[inlier], depths[inlier]
-    if len(rows) < 30:
-        raise RuntimeError(f"Only {len(rows)} depth inliers remain after robust filtering")
-
-    pixels_uv = np.column_stack((cols, rows)).astype(np.float64)
-    intrinsics = camera["color"]["intrinsics"]
-    distortion = camera["color"]["distortion"]
-    rays, deprojection_method = pixels_to_rays(pixels_uv, intrinsics, distortion)
-    points_camera = rays * depths[:, None]
-
-    mask_moments = cv2.moments(selected_mask, binaryImage=True)
-    mask_center_uv = np.array(
-        [mask_moments["m10"] / mask_moments["m00"], mask_moments["m01"] / mask_moments["m00"]], dtype=np.float64
-    )
-    center_index = int(np.argmin(np.sum((pixels_uv - mask_center_uv) ** 2, axis=1)))
-    surface_uv = pixels_uv[center_index]
-    surface_point = points_camera[center_index]
-    cloud_centroid = np.median(points_camera, axis=0)
-    normal_camera, normal_point_count, normal_eigenvalues = estimate_surface_normal(
-        points_camera, pixels_uv, surface_uv, args.normal_window_px, surface_point
-    )
-    pregrasp_camera = surface_point + args.pregrasp_offset_m * normal_camera
 
     calibration_path = args.calibration.resolve()
     calibration = read_json(calibration_path)
@@ -758,10 +947,8 @@ def main() -> None:
         if args.offset_mujoco_m is not None
         else configured_offset
     )
-    surface_mujoco = transform_point(matrix, surface_point) + point_offset
-    centroid_mujoco = transform_point(matrix, cloud_centroid) + point_offset
-    normal_mujoco = transform_vector(matrix, normal_camera)
-    pregrasp_mujoco = transform_point(matrix, pregrasp_camera) + point_offset
+    scale_m = float(camera["depth"]["scale_m_per_unit"])
+    depth_m = depth_raw.astype(np.float64) * scale_m
     excluded_table_mask = np.zeros(depth_raw.shape, dtype=bool)
     exclusion_dilate_px = int(
         calibration["table_detection"].get("object_exclusion_dilate_px", 12)
@@ -773,6 +960,8 @@ def main() -> None:
             (2 * exclusion_dilate_px + 1, 2 * exclusion_dilate_px + 1),
         )
     for instance_mask in masks:
+        if instance_mask is None:
+            continue
         exclusion = (
             cv2.dilate(instance_mask, exclusion_kernel)
             if exclusion_kernel is not None
@@ -786,8 +975,66 @@ def main() -> None:
         matrix,
         point_offset,
         calibration["table_detection"],
-        anchor_uv=surface_uv,
+        anchor_uv=None,
     )
+    projected_corners = project_mujoco_points_to_image(
+        table_corners_mujoco, matrix, point_offset, camera
+    )
+    candidate_filter_settings = calibration.get("candidate_filter", {})
+    candidate_depth_analyses: list[dict[str, Any] | None] = []
+    for detection, instance_mask in zip(detections, masks):
+        candidate_report, depth_analysis = evaluate_detection_candidate(
+            instance_mask,
+            depth_raw,
+            depth_m,
+            camera,
+            args,
+            matrix,
+            point_offset,
+            table_result,
+            projected_corners,
+            candidate_filter_settings,
+        )
+        detection["candidate_filter"] = candidate_report
+        candidate_depth_analyses.append(depth_analysis)
+
+    selected_index = select_detection(detections, args)
+    selected_mask = masks[selected_index]
+    selected_depth = candidate_depth_analyses[selected_index]
+    if selected_mask is None or selected_depth is None:
+        raise RuntimeError("Selected YOLOE detection has no usable segmentation depth")
+    selected = detections[selected_index]
+    selected_mask_path = output_dir / "selected_mask.png"
+    cv2.imwrite(str(selected_mask_path), selected_mask)
+    selected["mask_path"] = str(selected_mask_path)
+
+    binary_mask = selected_depth["binary_mask"]
+    inner_pixel_count = int(selected_depth["inner_pixel_count"])
+    raw_valid_pixel_count = int(selected_depth["raw_valid_pixel_count"])
+    valid_depth_fraction = float(selected_depth["valid_depth_fraction"])
+    median_depth = float(selected_depth["median_depth_m"])
+    mad = float(selected_depth["mad_m"])
+    depth_p05 = float(selected_depth["depth_p05_m"])
+    depth_p95 = float(selected_depth["depth_p95_m"])
+    depth_spread = float(selected_depth["depth_spread_m"])
+    band = float(selected_depth["accepted_half_band_m"])
+    quality_warnings = list(selected_depth["quality_warnings"])
+    pixels_uv = selected_depth["pixels_uv"]
+    points_camera = selected_depth["points_camera"]
+    mask_center_uv = selected_depth["mask_center_uv"]
+    surface_uv = selected_depth["surface_uv"]
+    surface_point = selected_depth["surface_point_camera_m"]
+    cloud_centroid = selected_depth["cloud_centroid_camera_m"]
+    deprojection_method = str(selected_depth["deprojection_method"])
+
+    normal_camera, normal_point_count, normal_eigenvalues = estimate_surface_normal(
+        points_camera, pixels_uv, surface_uv, args.normal_window_px, surface_point
+    )
+    pregrasp_camera = surface_point + args.pregrasp_offset_m * normal_camera
+    surface_mujoco = transform_point(matrix, surface_point) + point_offset
+    centroid_mujoco = transform_point(matrix, cloud_centroid) + point_offset
+    normal_mujoco = transform_vector(matrix, normal_camera)
+    pregrasp_mujoco = transform_point(matrix, pregrasp_camera) + point_offset
     mujoco_result = {
         "coordinate_frame": calibration["coordinate_system"]["name"],
         "axes": calibration["coordinate_system"]["axes"],
@@ -821,6 +1068,23 @@ def main() -> None:
             "classes": args.classes,
             "confidence_threshold": args.conf,
             "speed_ms": result.speed,
+        },
+        "candidate_filter": {
+            "method": "table_image_polygon_and_3d_footprint_with_signed_plane_height",
+            "thresholds": selected["candidate_filter"]["thresholds"],
+            "projected_table_polygon_uv": [
+                as_list(point, 2) for point in projected_corners
+            ],
+            "accepted_detection_indices": [
+                int(item["index"])
+                for item in detections
+                if item["candidate_filter"]["accepted"]
+            ],
+            "rejected_detection_indices": [
+                int(item["index"])
+                for item in detections
+                if not item["candidate_filter"]["accepted"]
+            ],
         },
         "detections": detections,
         "selected_detection_index": selected_index,
@@ -870,10 +1134,33 @@ def main() -> None:
     table_overlay = cv2.addWeighted(annotated, 0.72, cyan, 0.28, 0.0)
     annotated[table_mask] = table_overlay[table_mask]
 
-    projected_corners = np.rint(
-        project_mujoco_points_to_image(table_corners_mujoco, matrix, point_offset, camera)
-    ).astype(int)
-    cv2.polylines(annotated, [projected_corners.reshape(-1, 1, 2)], True, (255, 255, 0), 3)
+    projected_corners_int = np.rint(projected_corners).astype(int)
+    cv2.polylines(
+        annotated,
+        [projected_corners_int.reshape(-1, 1, 2)],
+        True,
+        (255, 255, 0),
+        3,
+    )
+
+    for detection in detections:
+        candidate = detection["candidate_filter"]
+        if "mask_center_uv" not in candidate:
+            continue
+        candidate_center = tuple(
+            np.rint(candidate["mask_center_uv"]).astype(int)
+        )
+        candidate_color = (0, 200, 0) if candidate["accepted"] else (0, 0, 255)
+        cv2.circle(annotated, candidate_center, 7, candidate_color, 2)
+        cv2.putText(
+            annotated,
+            f"#{detection['index']}",
+            (candidate_center[0] + 8, candidate_center[1] - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            candidate_color,
+            1,
+        )
 
     green = np.zeros_like(annotated)
     green[:, :, 1] = 255
@@ -896,6 +1183,11 @@ def main() -> None:
     cv2.imwrite(str(output_dir / "annotated.png"), annotated)
 
     print(f"Selected: #{selected_index} {selected['class_name']} conf={selected['confidence']:.3f}")
+    print(
+        "Tabletop candidate filter: "
+        f"{sum(item['candidate_filter']['accepted'] for item in detections)}/"
+        f"{len(detections)} accepted"
+    )
     print(f"Surface camera xyz [m]: {as_list(surface_point)}")
     print(f"Experimental local PCA normal: {as_list(normal_camera)}")
     if quality_warnings:

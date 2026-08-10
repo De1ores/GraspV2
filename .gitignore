@@ -11,12 +11,12 @@ htmlcov/
 /build/
 /install/
 /log/
-/aimdk09_build/
-/aimdk09_install/
-/aimdk09_log/
-/aimdk0907_build/
-/aimdk0907_install/
-/aimdk0907_log/
 
 # Regenerated vision output
 /output/
+
+# Generated offline deployment payloads
+/dist/
+/offline/wheelhouse/
+/offline/runtime/
+/mobileclip2_b.ts

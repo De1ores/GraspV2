@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "Gemini color optical frame to the graspV2 planning world at stable_stand",
+  "description": "Stored upright Gemini optical frame to the graspV2 planning world at stable_stand; capture rotates the physically upside-down sensor by 180 degrees",
   "coordinate_system": {
     "name": "graspv2_planning_world",
     "axes": "+X robot forward, +Y robot left, +Z up",
@@ -13,6 +13,7 @@
     "pelvis_world_xyz_m": [0.0, 0.0, 0.666452127019],
     "waist_joint_rad": [0.0, 0.0, 0.0],
     "head_yaw_pitch_rad": [0.0, 0.0],
+    "capture_image_rotation_deg": 180,
     "rgbd_geom_pos_in_head_pitch_m": [0.0576096, -0.0111832, -0.0483697],
     "rgbd_geom_quat_wxyz": [0.298835, 0.640857, 0.640857, 0.298835],
     "R_rgbd_geom_camera_optical": [
@@ -47,6 +48,11 @@
     "short_side_range_m": [0.25, 1.2],
     "long_side_range_m": [0.4, 2.0],
     "collision_thickness_m": 0.04
+  },
+  "candidate_filter": {
+    "minimum_height_above_table_m": 0.01,
+    "table_polygon_margin_px": 0.0,
+    "table_footprint_margin_m": 0.0
   },
   "warning": "Nominal stable_stand transform. Tune point_offset_mujoco_m after the camera is rigidly mounted; recompute the matrix when pelvis, waist, or head pose differs."
 }

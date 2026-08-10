@@ -27,6 +27,7 @@ from graspv2.hardware_contract import (  # noqa: E402
     DEFAULT_HARDWARE_CONFIG_PATH,
     load_hardware_config,
 )
+from graspv2.ros_logging import configure_fastdds_logging  # noqa: E402
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -61,6 +62,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=0.001,
         help="Meters represented by one 16UC1 depth unit (ROS convention: 0.001)",
+    )
+    parser.add_argument(
+        "--image-rotation-deg",
+        type=int,
+        choices=(0, 180),
+        default=180,
+        help=(
+            "Rotate both registered RGB and depth before storage. The X2 "
+            "competition camera is mounted upside down, so the default is 180."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -235,8 +246,15 @@ class RgbdCapture(Node):
             )
 
 
-def _distortion(camera_info: CameraInfo) -> dict[str, float | str]:
+def _distortion(
+    camera_info: CameraInfo, image_rotation_deg: int = 0
+) -> dict[str, float | str]:
     coefficients = list(camera_info.d) + [0.0] * max(0, 8 - len(camera_info.d))
+    if image_rotation_deg == 180:
+        # Brown-Conrady tangential coefficients change sign when both normalized
+        # image axes are negated. Radial coefficients remain unchanged.
+        coefficients[2] = -coefficients[2]
+        coefficients[3] = -coefficients[3]
     return {
         "model": camera_info.distortion_model or "none",
         "k1": float(coefficients[0]),
@@ -248,6 +266,37 @@ def _distortion(camera_info: CameraInfo) -> dict[str, float | str]:
         "k5": float(coefficients[6]),
         "k6": float(coefficients[7]),
     }
+
+
+def _intrinsics(
+    camera_info: CameraInfo, image_rotation_deg: int = 0
+) -> dict[str, float | int]:
+    cx = float(camera_info.k[2])
+    cy = float(camera_info.k[5])
+    width = int(camera_info.width)
+    height = int(camera_info.height)
+    if image_rotation_deg == 180:
+        cx = (width - 1) - cx
+        cy = (height - 1) - cy
+    return {
+        "fx": float(camera_info.k[0]),
+        "fy": float(camera_info.k[4]),
+        "cx": cx,
+        "cy": cy,
+        "width": width,
+        "height": height,
+    }
+
+
+def rotate_rgbd_180(
+    color: np.ndarray, depth: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Rotate an aligned RGB-D pair without introducing interpolation."""
+    if color.shape[:2] != depth.shape:
+        raise ValueError(
+            f"Color/depth shape mismatch before rotation: {color.shape[:2]} vs {depth.shape}"
+        )
+    return cv2.rotate(color, cv2.ROTATE_180), cv2.rotate(depth, cv2.ROTATE_180)
 
 
 def _camera_matrix(camera_info: CameraInfo) -> np.ndarray:
@@ -451,6 +500,10 @@ def write_capture(pair: CapturedPair, args: argparse.Namespace) -> None:
         depth_frame_id=pair.depth.header.frame_id,
         color_frame_id=pair.color.header.frame_id,
     )
+    image_rotation_deg = int(args.image_rotation_deg)
+    if image_rotation_deg == 180:
+        color, depth = rotate_rgbd_180(color, depth)
+        registration = f"{registration}_then_rotate_180"
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -477,8 +530,17 @@ def write_capture(pair: CapturedPair, args: argparse.Namespace) -> None:
             "registered_sample_count": registered_samples,
             "frame_id": pair.color.header.frame_id,
         },
+        "image_orientation": {
+            "rotation_deg": image_rotation_deg,
+            "reason": (
+                "X2 competition RGB-D camera is physically mounted upside down"
+                if image_rotation_deg == 180
+                else "rotation disabled by capture option"
+            ),
+            "applied_to": ["color.png", "depth.png", "camera intrinsics"],
+        },
         "camera_coordinate_convention": (
-            "color optical frame: +x right, +y down, +z forward"
+            "stored upright color optical frame: +x right, +y down, +z forward"
         ),
         "ros_topics": {
             "color": args.color_topic,
@@ -492,15 +554,8 @@ def write_capture(pair: CapturedPair, args: argparse.Namespace) -> None:
             "timestamp_ms": _stamp_ns(pair.color) / 1_000_000.0,
             "frame_id": pair.color.header.frame_id,
             "encoding": pair.color.encoding,
-            "intrinsics": {
-                "fx": float(color_info.k[0]),
-                "fy": float(color_info.k[4]),
-                "cx": float(color_info.k[2]),
-                "cy": float(color_info.k[5]),
-                "width": int(color_info.width),
-                "height": int(color_info.height),
-            },
-            "distortion": _distortion(color_info),
+            "intrinsics": _intrinsics(color_info, image_rotation_deg),
+            "distortion": _distortion(color_info, image_rotation_deg),
         },
         "depth": {
             "width": int(depth.shape[1]),
@@ -513,15 +568,8 @@ def write_capture(pair: CapturedPair, args: argparse.Namespace) -> None:
             "storage": "uint16_png",
             "value_scale_mm_per_unit": args.depth_scale_m * 1000.0,
             "scale_m_per_unit": args.depth_scale_m,
-            "source_intrinsics": {
-                "fx": float(depth_info.k[0]),
-                "fy": float(depth_info.k[4]),
-                "cx": float(depth_info.k[2]),
-                "cy": float(depth_info.k[5]),
-                "width": int(depth_info.width),
-                "height": int(depth_info.height),
-            },
-            "source_distortion": _distortion(depth_info),
+            "source_intrinsics": _intrinsics(depth_info, image_rotation_deg),
+            "source_distortion": _distortion(depth_info, image_rotation_deg),
         },
         "synchronization": {"skew_ms": pair.skew_ms},
     }
@@ -539,6 +587,7 @@ def write_capture(pair: CapturedPair, args: argparse.Namespace) -> None:
         f"scale={args.depth_scale_m} m/unit)"
     )
     print(f"Depth registration: {registration}, samples={registered_samples}")
+    print(f"Stored RGB-D rotation: {image_rotation_deg} deg")
     print(f"Output: {output_dir}")
 
 
@@ -551,6 +600,7 @@ def main() -> int:
     if args.warmup_frames < 1:
         raise ValueError("warmup frames must be at least 1")
 
+    configure_fastdds_logging()
     rclpy.init(args=[])
     node = RgbdCapture(args)
     deadline = time.monotonic() + args.timeout

@@ -1,0 +1,5 @@
+numpy==2.2.6
+mujoco==3.11.0
+pin==4.1.0
+x2-ik-sdk==0.1.0
+tomli==2.2.1; python_version < "3.11"
