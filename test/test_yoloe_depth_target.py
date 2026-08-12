@@ -68,11 +68,21 @@ def _evaluate(
     *,
     mask_bounds: tuple[int, int, int, int] = (45, 45, 55, 55),
     depth_units: int = 900,
+    table_size_xy_m: tuple[float, float] = (2.0, 2.0),
+    settings_overrides: dict[str, float] | None = None,
 ) -> tuple[dict, dict | None]:
     mask, depth_raw, depth_m, camera, table_result, corners = _candidate_fixture(
         mask_bounds=mask_bounds,
         depth_units=depth_units,
     )
+    table_result["visible_extent"]["size_xy_m"] = list(table_size_xy_m)
+    settings = {
+        "minimum_height_above_table_m": 0.01,
+        "table_polygon_margin_px": 0.0,
+        "table_footprint_margin_m": 0.0,
+        "table_footprint_tolerance_m": 0.0,
+    }
+    settings.update(settings_overrides or {})
     return evaluate_detection_candidate(
         mask,
         depth_raw,
@@ -83,11 +93,7 @@ def _evaluate(
         np.zeros(3),
         table_result,
         corners,
-        {
-            "minimum_height_above_table_m": 0.01,
-            "table_polygon_margin_px": 0.0,
-            "table_footprint_margin_m": 0.0,
-        },
+        settings,
     )
 
 
@@ -156,3 +162,21 @@ def test_candidate_rejects_surface_too_close_to_table_plane() -> None:
     assert report["accepted"] is False
     assert "surface_not_high_enough_above_table" in report["rejection_reasons"]
 
+
+def test_candidate_allows_small_table_edge_projection_tolerance() -> None:
+    rejected, _ = _evaluate(
+        mask_bounds=(55, 45, 65, 55),
+        table_size_xy_m=(0.1, 2.0),
+    )
+    accepted, _ = _evaluate(
+        mask_bounds=(55, 45, 65, 55),
+        table_size_xy_m=(0.1, 2.0),
+        settings_overrides={"table_footprint_tolerance_m": 0.05},
+    )
+
+    assert rejected["accepted"] is False
+    assert "surface_projection_outside_table_footprint" in rejected[
+        "rejection_reasons"
+    ]
+    assert accepted["accepted"] is True
+    assert accepted["surface_projection_overflow_xy_m"][0] > 0.0

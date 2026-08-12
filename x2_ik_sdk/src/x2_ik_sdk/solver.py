@@ -156,7 +156,7 @@ class X2ArmIKSolver:
             err_rot = pin.log3(R_des @ oMf.rotation.T)
             err = np.concatenate([err_pos, err_rot])
             err_norm = float(np.linalg.norm(err))
-            if err_norm < self.config.eps:
+            if err_norm < self.config.pose_eps:
                 success = True
                 break
 
@@ -180,6 +180,107 @@ class X2ArmIKSolver:
             iterations=iterations,
             success=success,
         )
+
+    def solve_position_axis(
+        self,
+        side: ArmSide | str,
+        target_xyz: Iterable[float],
+        local_axis: Iterable[float],
+        target_axis: Iterable[float],
+        current_arm_pos: Iterable[float] | None = None,
+        *,
+        current_head_pos: Iterable[float] | None = None,
+        q_seed: np.ndarray | None = None,
+        orientation_weight: float = 0.25,
+        position_tolerance_m: float = 1e-3,
+        axis_tolerance_rad: float = math.radians(1.0),
+    ) -> IKResult:
+        """Solve position while aligning one TCP axis, leaving axial yaw free."""
+
+        side = ArmSide(side)
+        target = np.asarray(list(target_xyz), dtype=float)
+        local = np.asarray(list(local_axis), dtype=float)
+        desired = np.asarray(list(target_axis), dtype=float)
+        if target.shape != (3,):
+            raise ValueError(f"target_xyz must have length 3, got {target}")
+        if local.shape != (3,) or desired.shape != (3,):
+            raise ValueError("local_axis and target_axis must have length 3")
+        if not np.all(np.isfinite(target)):
+            raise ValueError("target_xyz must contain finite values")
+        local_norm = float(np.linalg.norm(local))
+        desired_norm = float(np.linalg.norm(desired))
+        if local_norm <= 1e-12 or desired_norm <= 1e-12:
+            raise ValueError("local_axis and target_axis must be non-zero")
+        if not math.isfinite(orientation_weight) or orientation_weight <= 0.0:
+            raise ValueError("orientation_weight must be positive and finite")
+        if position_tolerance_m <= 0.0 or axis_tolerance_rad <= 0.0:
+            raise ValueError("position and axis tolerances must be positive")
+        local /= local_norm
+        desired /= desired_norm
+
+        q = self._seed_q(current_arm_pos, current_head_pos, q_seed)
+        frame_name = self.model.frames[self._task_frame_ids[side]].name
+        frame_id = self._task_frame_ids[side]
+        active_v_idxs = self._active_velocity_indices(side)
+        err_norm = math.inf
+        iterations = 0
+        success = False
+        for iterations in range(1, self.config.max_iters + 1):
+            pin.forwardKinematics(self.model, self.data, q)
+            pin.updateFramePlacements(self.model, self.data)
+            oMf = self.data.oMf[frame_id]
+            current_axis = oMf.rotation @ local
+            err_pos = target - oMf.translation
+            err_rot = self._axis_rotation_error(current_axis, desired)
+            position_error = float(np.linalg.norm(err_pos))
+            axis_error = float(np.linalg.norm(err_rot))
+            err = np.concatenate([err_pos, orientation_weight * err_rot])
+            err_norm = float(math.hypot(position_error, axis_error))
+            if (
+                position_error <= position_tolerance_m
+                and axis_error <= axis_tolerance_rad
+            ):
+                success = True
+                break
+            jacobian = pin.computeFrameJacobian(
+                self.model,
+                self.data,
+                q,
+                frame_id,
+                pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+            )
+            weighted_jacobian = jacobian.copy()
+            weighted_jacobian[3:, :] *= orientation_weight
+            q = self._integrate_step(q, weighted_jacobian, err, active_v_idxs)
+
+        return self._make_result(
+            side=side,
+            q=q,
+            frame_name=frame_name,
+            frame_id=frame_id,
+            target_xyz=target.tolist(),
+            target_rpy=None,
+            err_norm=err_norm,
+            iterations=iterations,
+            success=success,
+        )
+
+    @staticmethod
+    def _axis_rotation_error(current: np.ndarray, desired: np.ndarray) -> np.ndarray:
+        """Return the shortest world-frame rotation taking current to desired."""
+
+        cross = np.cross(current, desired)
+        sine = float(np.linalg.norm(cross))
+        cosine = float(np.clip(np.dot(current, desired), -1.0, 1.0))
+        if sine > 1e-10:
+            return cross * (math.atan2(sine, cosine) / sine)
+        if cosine >= 0.0:
+            return np.zeros(3, dtype=float)
+        basis = np.zeros(3, dtype=float)
+        basis[int(np.argmin(np.abs(current)))] = 1.0
+        perpendicular = np.cross(current, basis)
+        perpendicular /= float(np.linalg.norm(perpendicular))
+        return math.pi * perpendicular
 
     def fk_xyz(
         self,

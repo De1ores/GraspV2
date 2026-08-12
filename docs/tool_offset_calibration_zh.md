@@ -63,8 +63,10 @@ p_world_tcp = p_world_base + R_world_base × [dx, dy, dz]
 "translation_m": [0.008, 0.0, 0.065]
 ```
 
-规划目标仍然是视觉给出的物体抓取点。增加 TCP 平移后，IK 会自动反算 OmniPicker
-基座应该移动到哪里，使配置后的真实 TCP 到达同一个物体点；不要再手工移动视觉目标。
+规划目标仍然是视觉给出的 `gripper_center_mujoco_m`。增加 TCP 平移后，IK 会自动反算
+OmniPicker 基座应该移动到哪里，使配置后的真实 TCP 到达同一个夹爪中心；不要再手工移动
+视觉目标。`surface_point_mujoco_m` 只用于调试，`object_center_mujoco_m` 用于物体跟踪，
+两者都不会被误当成 TCP 目标。
 
 右侧 OmniPicker 基座在官方 URDF 中带固定旋转，因此必须在它自己的局部坐标系中测量，
 不能直接把世界坐标位移填入配置。
@@ -114,7 +116,7 @@ p_world_tcp = p_world_base + R_world_base × [dx, dy, dz]
    其中 `active_tcp_offset` 必须与刚填写的值一致。
 6. 最后使用一个已知世界坐标的标定点做右手实机低速验证。
 
-若观察到整个桌子、物体和抓取点一起偏移，应调整
+若观察到整个桌子、物体中心和夹爪中心一起偏移，应调整
 `config/mujoco_camera_calibration.json` 的相机外参/全局点偏移；若只有夹爪实际抓取中心
 相对规划点有固定误差，才调整本文件的 tool offset。两者不能混用。
 
@@ -142,7 +144,7 @@ contype="0" conaffinity="0" density="0"
 ```
 
 桌子、机器人手臂代理和 OmniPicker 仍参与碰撞检查。目标物保持显示-only 是有意设计，
-因为现有碰撞门会拒绝所有非白名单接触；若直接给圆柱打开碰撞，末端到达抓取点时会被
+因为现有碰撞门会拒绝所有非白名单接触；若直接给圆柱打开碰撞，末端到达夹爪中心目标时会被
 判为碰撞，导致抓取规划失败。若以后需要真实物体接触，应一起实现：目标物碰撞几何、
 仅允许所选 OmniPicker 接触目标物的白名单、接触阶段切换，以及桌面/非目标物仍然禁止
 接触的规则。

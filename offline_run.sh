@@ -3,6 +3,15 @@ set -euo pipefail
 
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
+# Help must be available on a packaging host and before the first Jetson
+# installation.  It must never trigger architecture checks or environment
+# creation.
+for argument in "$@"; do
+  case "$argument" in
+    -h|--help) exec "$repo_dir/run_full_grasp_pipeline.sh" --help ;;
+  esac
+done
+
 if [[ ! -f "$repo_dir/.offline-install.complete" ]]; then
   "$repo_dir/install_offline.sh"
 fi
@@ -31,10 +40,5 @@ export YOLO_CONFIG_DIR="$repo_dir/.runtime/ultralytics"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export NO_ALBUMENTATIONS_UPDATE=1
-
-# Load ROS, AimDK and the project overlay before RGB-D capture, planning or
-# hardware preflight.  Child scripts inherit this exact offline environment.
-# shellcheck source=/dev/null
-source "$repo_dir/tools/setup_x2_mc_env.sh"
 
 exec "$repo_dir/run_full_grasp_pipeline.sh" "$@"

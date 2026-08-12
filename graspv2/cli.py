@@ -3,20 +3,23 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 import subprocess
 import sys
 
 from .mc_animation import (
     build_mc_animation,
+    validate_animation_trajectory_source,
     validate_mc_animation_csv,
     write_mc_animation_csv,
 )
 from .planner import (
+    SimulatedGraspSequence,
     plan_lift_trajectory,
+    plan_simulated_grasp_sequence,
     plan_trajectory,
     preview_scene,
+    replay_grasp_sequence,
     replay_viewer,
 )
 from .robot_profiles import (
@@ -34,6 +37,7 @@ DEFAULT_TRAJECTORY = ROOT / "output" / "planned_trajectory.json"
 DEFAULT_REPORT = ROOT / "output" / "planning_report.json"
 DEFAULT_ANIMATION = ROOT / "output" / "mc_animation.csv"
 DEFAULT_VISION_RESULT = ROOT / "output" / "result.json"
+DEFAULT_DEMO_SCENE = ROOT / "config" / "mujoco_demo_scene.json"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -47,7 +51,7 @@ def _parser() -> argparse.ArgumentParser:
         ),
         epilog="""示例：
   ./run.sh
-      使用上次视觉抓取点生成桌子，规划后打开 MuJoCo Viewer。
+      使用上次视觉夹爪中心生成桌子，规划后打开 MuJoCo Viewer。
 
   ./run.sh --headless
       使用同一桌子和规划，但不打开窗口，适用于 SSH/Orin。
@@ -56,10 +60,13 @@ def _parser() -> argparse.ArgumentParser:
       显式指定另一份视觉结果；语义与默认路径相同。
 
   ./run.sh --target 0.38 -0.30 0.92
-      保留默认视觉桌面，仅用手工世界坐标覆盖视觉抓取点。
+      保留默认视觉桌面，仅用手工世界坐标覆盖视觉夹爪中心。
 
   ./run.sh --no-vision
       不读取视觉 JSON，不生成桌面障碍，改用内置可达测试目标。
+
+  ./run.sh --demo-scene
+      使用内置 X2 Ultra、右侧 OmniPicker、桌子和杯子场景并打开 Viewer。
 
   ./run.sh --mode animation
       把已验证轨迹转换为 CSV；完全离线，不连接机器人。
@@ -105,8 +112,8 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         metavar=("X", "Y", "Z"),
         help=(
-            "实际抓取 TCP 的目标世界坐标，单位米；默认取视觉抓取点；"
-            "与视觉结果同用时只覆盖抓取点，仍保留视觉桌面障碍"
+            "实际抓取 TCP 的目标世界坐标，单位米；默认取视觉夹爪中心；"
+            "与视觉结果同用时只覆盖夹爪中心，仍保留视觉桌面障碍"
         ),
     )
     vision_group = parser.add_mutually_exclusive_group()
@@ -115,13 +122,18 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         help=(
             f"视觉结果 JSON（默认 {DEFAULT_VISION_RESULT}），读取 "
-            "grasp_point_mujoco_m 和桌面碰撞盒"
+            "object_center_mujoco_m、gripper_center_mujoco_m 和桌面碰撞盒"
         ),
     )
     vision_group.add_argument(
         "--no-vision",
         action="store_true",
         help="禁用默认视觉结果和桌面障碍；无 --target 时使用内置可达测试目标",
+    )
+    vision_group.add_argument(
+        "--demo-scene",
+        action="store_true",
+        help="使用内置 X2 Ultra + 右侧 OmniPicker + 桌子/杯子 MuJoCo 场景",
     )
     parser.add_argument(
         "--trajectory",
@@ -138,7 +150,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lift-trajectory",
         type=Path,
-        help="同时生成从抓取点向桌面法向抬升的独立碰撞验证轨迹",
+        help="同时生成从夹爪中心目标向桌面法向抬升的独立碰撞验证轨迹",
     )
     parser.add_argument(
         "--lift-report",
@@ -146,16 +158,26 @@ def _parser() -> argparse.ArgumentParser:
         help="抬升轨迹验证报告；默认使用 lift trajectory 同目录下的 report 文件",
     )
     parser.add_argument(
+        "--return-trajectory",
+        type=Path,
+        help="同时生成从抬升点安全返回默认位的独立碰撞验证轨迹",
+    )
+    parser.add_argument(
+        "--return-report",
+        type=Path,
+        help="返回轨迹验证报告；默认使用 return trajectory 同目录下的 report 文件",
+    )
+    parser.add_argument(
         "--lift-height",
         type=float,
-        default=0.10,
-        help="视觉验证抓取使用的抬升距离，单位米（默认 0.10）",
+        default=0.045,
+        help="视觉验证抓取使用的抬升距离，单位米（默认 0.045）",
     )
     parser.add_argument(
         "--lift-duration",
         type=float,
-        default=2.0,
-        help="抬升动作时长，单位秒（默认 2.0）",
+        default=2.5,
+        help="抬升动作时长，单位秒（默认 2.5）",
     )
     parser.add_argument(
         "--animation",
@@ -174,8 +196,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--approach-distance",
         type=float,
-        default=0.075,
-        help="预抓取点沿桌面法向离目标的距离，单位米（默认 0.075，范围 0.01~0.30）",
+        default=0.03,
+        help=(
+            "识别到物体时，预抓点高于物体估计顶部的距离；无物体模型时为"
+            "预抓点到目标的距离，单位米（默认 0.03，范围 0.01~0.30）"
+        ),
     )
     parser.add_argument(
         "--speed-scale",
@@ -222,18 +247,33 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     if args.animation is not None and args.mode != "animation":
         parser.error("--animation is only valid with --mode animation")
     if args.animation is not None and (
-        args.target is not None or args.vision_result is not None or args.no_vision
+        args.target is not None
+        or args.vision_result is not None
+        or args.no_vision
+        or args.demo_scene
     ):
         parser.error("an existing --animation cannot be combined with planning inputs")
     if args.lift_report is not None and args.lift_trajectory is None:
         parser.error("--lift-report requires --lift-trajectory")
+    if args.return_report is not None and args.return_trajectory is None:
+        parser.error("--return-report requires --return-trajectory")
+    if args.return_trajectory is not None and args.lift_trajectory is None:
+        parser.error("--return-trajectory requires --lift-trajectory")
     if args.lift_trajectory is not None and args.mode != "sim":
         parser.error("--lift-trajectory is only valid with --mode sim")
+    if args.return_trajectory is not None and args.mode != "sim":
+        parser.error("--return-trajectory is only valid with --mode sim")
 
 
 def _resolve_vision_result(args: argparse.Namespace) -> Path | None:
     if args.no_vision:
         return None
+    if args.demo_scene:
+        if not DEFAULT_DEMO_SCENE.is_file():
+            raise RuntimeError(
+                f"built-in MuJoCo demo scene is missing: {DEFAULT_DEMO_SCENE}"
+            )
+        return DEFAULT_DEMO_SCENE.resolve()
     source = (
         args.vision_result.expanduser().resolve()
         if args.vision_result is not None
@@ -277,22 +317,23 @@ def _plan_with_installed_gripper(
 
 def _plan(args: argparse.Namespace, profile: RobotProfile):
     vision_result = _resolve_vision_result(args)
-    print(
-        f"Vision obstacle: {vision_result}"
-        if vision_result is not None
-        else "Vision obstacle: disabled (--no-vision)"
-    )
+    if args.demo_scene:
+        print(f"MuJoCo demo scene: {vision_result}")
+    elif vision_result is not None:
+        print(f"Vision obstacle: {vision_result}")
+    else:
+        print("Vision obstacle: disabled (--no-vision)")
     result = _plan_with_installed_gripper(args, profile, vision_result)
     trajectory = args.trajectory.expanduser().resolve()
     report = args.report.expanduser().resolve()
-    result.write(trajectory, report)
     print(f"Robot: {profile.name} ({profile.arm_dof} DoF/arm)")
     print("IK: official x2_ik_sdk")
+    print(f"Kinematic URDF: {result.report['kinematic_urdf']}")
     visual_urdf = result.report["robot_visual_urdf"]
     print(
         f"Robot visual URDF: {visual_urdf}"
         if visual_urdf is not None
-        else "Robot visual URDF: not found (collision proxies only)"
+        else "Robot appearance: full-body proxies generated from kinematic URDF"
     )
     omnipicker_description = result.report["omnipicker_visual_description"]
     print(
@@ -307,12 +348,59 @@ def _plan(args: argparse.Namespace, profile: RobotProfile):
         f"frames={len(result.times)}, duration={result.duration_s:.3f}s, "
         f"final_error={result.report['final_position_error_m']:.6f}m"
     )
-    if args.lift_trajectory is not None:
+    if result.report.get("nearest_ik_fallback_used"):
+        print(
+            "IK nearest-point fallback: ACCEPTED after collision/edge checks; "
+            f"waypoints={result.report['nearest_ik_fallback_count']}, "
+            "maximum_position_error="
+            f"{result.report['nearest_ik_fallback_maximum_error_m']:.6f}m, "
+            f"limit={result.report['nearest_ik_fallback_limit_m']:.3f}m"
+        )
+    sequence: SimulatedGraspSequence | None = None
+    if result.obstacle is not None and result.obstacle.target_object is not None:
+        sequence = plan_simulated_grasp_sequence(
+            result,
+            lift_height_m=args.lift_height,
+            lift_duration_s=args.lift_duration,
+        )
+        lift = sequence.lift
+        opening_tilt = sequence.report[
+            "maximum_descent_opening_table_tilt_deg"
+        ]
+        opening_tilt_text = (
+            f"{float(opening_tilt):.3f}deg"
+            if opening_tilt is not None
+            else "not-constrained"
+        )
+        print(
+            "Grasp sequence gate: PASS; "
+            f"mode={result.report['grasp_mode']}, "
+            f"visual_radius={sequence.visual_radius_m:.3f}m, "
+            f"preopen={sequence.preopen_position:.3f}, "
+            f"grip={sequence.grip_position:.3f}, "
+            f"lift={lift.duration_s:.3f}s, "
+            f"hold={sequence.lifted_hold_duration_s:.3f}s, "
+            f"lower={sequence.report['controlled_lower_duration_s']:.3f}s, "
+            f"return={sequence.return_to_default.duration_s:.3f}s, "
+            f"opening_table_tilt={opening_tilt_text}"
+        )
+        print(
+            "Phases: robot-side raised safe staging -> 3cm above object top -> "
+            "fully open -> vertical descend -> radius close -> grasp -> lift -> "
+            "hold -> controlled lower -> release -> open-hand retreat -> "
+            "close at pregrasp -> default"
+        )
+        result.report["simulated_grasp_sequence"] = sequence.report
+    elif args.lift_trajectory is not None:
         lift = plan_lift_trajectory(
             result,
             lift_height_m=args.lift_height,
             lift_duration_s=args.lift_duration,
         )
+    else:
+        lift = None
+    if args.lift_trajectory is not None:
+        assert lift is not None
         lift_trajectory = args.lift_trajectory.expanduser().resolve()
         lift_report = (
             args.lift_report.expanduser().resolve()
@@ -330,42 +418,45 @@ def _plan(args: argparse.Namespace, profile: RobotProfile):
             f"height={args.lift_height:.3f}m, "
             f"final_error={lift.report['final_position_error_m']:.6f}m"
         )
-    return result
-
-
-def _read_trajectory_document(path: Path) -> dict[str, object]:
-    try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise TrajectoryValidationError(f"cannot read trajectory metadata: {error}") from error
-    if not isinstance(document, dict):
-        raise TrajectoryValidationError("trajectory root must be an object")
-    return document
+        if lift.report.get("nearest_ik_fallback_used"):
+            print(
+                "Lift IK nearest-point fallback: ACCEPTED after "
+                "collision/edge checks; waypoints="
+                f"{lift.report['nearest_ik_fallback_count']}, "
+                "maximum_position_error="
+                f"{lift.report['nearest_ik_fallback_maximum_error_m']:.6f}m, "
+                f"limit={lift.report['nearest_ik_fallback_limit_m']:.3f}m"
+            )
+    if args.return_trajectory is not None:
+        if sequence is None:
+            raise RuntimeError(
+                "return trajectory requires a selected visual target and complete "
+                "grasp sequence"
+            )
+        return_trajectory = args.return_trajectory.expanduser().resolve()
+        return_report = (
+            args.return_report.expanduser().resolve()
+            if args.return_report is not None
+            else return_trajectory.with_name(
+                return_trajectory.stem + "_report.json"
+            )
+        )
+        sequence.return_to_default.write(return_trajectory, return_report)
+        print(f"Return trajectory: {return_trajectory}")
+        print(f"Return report: {return_report}")
+        print(
+            "Return gate: PASS; "
+            f"frames={len(sequence.return_to_default.times)}, "
+            f"duration={sequence.return_to_default.duration_s:.3f}s"
+        )
+    result.write(trajectory, report)
+    return sequence if sequence is not None else result
 
 
 def _validate_trajectory_profile(path: Path, profile: RobotProfile) -> None:
-    document = _read_trajectory_document(path)
-    value = document.get("robot_profile")
-    if value is not None and not isinstance(value, str):
-        raise TrajectoryValidationError("trajectory robot_profile must be a string")
-    declared = value
-    if declared is not None and declared != profile.name:
-        raise TrajectoryValidationError(
-            f"trajectory was generated for {declared!r}, not {profile.name!r}"
-        )
-    side = document.get("arm_side")
-    if side != INSTALLED_GRIPPER_SIDE:
-        raise TrajectoryValidationError(
-            "trajectory must use the right arm because the competition robot "
-            "has no left OmniPicker"
-        )
-    planning = document.get("planning")
-    if not isinstance(planning, dict):
-        raise TrajectoryValidationError("trajectory has no planning verification")
-    if planning.get("verified_collision_free") is not True:
-        raise TrajectoryValidationError("trajectory is not verified collision-free")
-    if planning.get("ik_backend") != "x2_ik_sdk.X2ArmIKSolver":
-        raise TrajectoryValidationError("trajectory was not generated by official IK")
+    """Backward-compatible name for the shared animation provenance gate."""
+
+    validate_animation_trajectory_source(path, profile)
 
 
 def _animation(args: argparse.Namespace, profile: RobotProfile) -> int:
@@ -382,6 +473,7 @@ def _animation(args: argparse.Namespace, profile: RobotProfile) -> int:
             args.target is not None
             or args.vision_result is not None
             or args.no_vision
+            or args.demo_scene
             or not trajectory_path.is_file()
         ):
             print("Running the simulation gate before animation conversion.")
@@ -452,7 +544,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 raise planning_error
             if not args.headless:
-                replay_viewer(result)
+                if isinstance(result, SimulatedGraspSequence):
+                    replay_grasp_sequence(result)
+                else:
+                    replay_viewer(result)
             return 0
         return _animation(args, profile)
     except (OSError, RuntimeError, ValueError, TrajectoryValidationError) as error:

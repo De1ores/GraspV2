@@ -2,12 +2,6 @@
 set -euo pipefail
 
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-if [[ "${GRASPV2_X2_ENV_READY:-0}" != "1" ]]; then
-  # Direct invocations must use the same ROS/AimDK/project overlay ordering as
-  # offline_run.sh, including the initial X2 RGB-D capture.
-  # shellcheck source=/dev/null
-  source "$repo_dir/tools/setup_x2_mc_env.sh"
-fi
 vision_result="$repo_dir/output/result.json"
 if [[ -n "${GRASPV2_PLANNING_PYTHON:-}" ]]; then
   planning_python="$GRASPV2_PLANNING_PYTHON"
@@ -19,12 +13,13 @@ fi
 target_class=""
 robot="ultra"
 vision_conf="0.20"
+image_rotation_deg="auto"
 table_clearance="0.025"
-lift_height="0.10"
-lift_duration="2.0"
-capture_backend="x2-aimdk"
+lift_height="0.045"
+lift_duration="2.5"
+capture_backend="auto"
 verification_capture_backend=""
-camera_calibration=""
+camera_calibration="${GRASPV2_CAMERA_CALIBRATION:-}"
 verification_timeout="45"
 close_target_tolerance="0.08"
 lifted_target_tolerance="0.10"
@@ -36,12 +31,21 @@ execute=false
 confirm_calibrated=false
 assume_yes=false
 
+ensure_x2_control_environment() {
+  if [[ "${GRASPV2_X2_ENV_READY:-0}" != "1" ]]; then
+    # Capture initializes its own ROS environment in run_vision.sh.  Keep the
+    # parent process independent of ROS/AimDK until live control is requested.
+    # shellcheck source=/dev/null
+    source "$repo_dir/tools/setup_x2_mc_env.sh"
+  fi
+}
+
 usage() {
   cat <<'EOF'
 Usage: ./run_full_grasp_pipeline.sh --target-class NAME [options]
 
 Capture RGB-D, recognize exactly one requested object class, plan collision-
-checked approach/lift paths, and prepare a visually verified grasp sequence.
+checked approach/lift/return paths, and prepare a visually verified grasp sequence.
 
 Required:
   --target-class NAME       Competition prompt: cup, "orange-capped pill bottle",
@@ -49,14 +53,19 @@ Required:
 Options:
   --robot ultra             Compatibility option; Ultra is the only supported model.
   --vision-conf VALUE       Detection threshold (default: 0.20).
+  --image-rotation-deg MODE auto (default), calibrated, 0, or 180.
+                            auto starts at 0 and retries 180 only when the table
+                            is not recognized; calibrated uses the profile.
   --table-clearance METERS  Required table clearance (default: 0.025).
-  --lift-height METERS      Lift distance along the table normal (default: 0.10).
-  --lift-duration SEC       Lift motion duration (default: 2.0).
-  --capture-backend MODE    x2-aimdk (default), orbbec-sdk, or existing.
+  --lift-height METERS      Lift distance along the table normal (default: 0.045).
+  --lift-duration SEC       Lift motion duration (default: 2.5).
+  --capture-backend MODE    auto (default), x2-aimdk, orbbec-sdk, or existing.
+                            auto uses X2 topics and falls back to the local SDK
+                            only when the topic set times out.
                             existing consumes a manually captured RGB-D frame.
   --verification-capture-backend MODE
-                            Fresh checkpoint capture: x2-aimdk or orbbec-sdk.
-                            Defaults to the capture backend, or x2-aimdk when
+                            Fresh checkpoint capture: auto, x2-aimdk or orbbec-sdk.
+                            Defaults to the capture backend, or auto when
                             the initial input uses existing files.
   --camera-calibration PATH Camera-to-MuJoCo calibration for the selected sensor.
   --verification-timeout SEC
@@ -83,12 +92,13 @@ EOF
 
 while (($#)); do
   case "$1" in
-    --target-class|--robot|--vision-conf|--table-clearance|--lift-height|--lift-duration|--capture-backend|--verification-capture-backend|--camera-calibration|--verification-timeout|--close-target-tolerance|--lifted-target-tolerance|--minimum-lift-ratio|--maximum-lateral-drift)
+    --target-class|--robot|--vision-conf|--image-rotation-deg|--table-clearance|--lift-height|--lift-duration|--capture-backend|--verification-capture-backend|--camera-calibration|--verification-timeout|--close-target-tolerance|--lifted-target-tolerance|--minimum-lift-ratio|--maximum-lateral-drift)
       (($# >= 2)) || { echo "$1 requires a value" >&2; exit 2; }
       case "$1" in
         --target-class) target_class="$2" ;;
         --robot) robot="$2" ;;
         --vision-conf) vision_conf="$2" ;;
+        --image-rotation-deg) image_rotation_deg="$2" ;;
         --table-clearance) table_clearance="$2" ;;
         --lift-height) lift_height="$2" ;;
         --lift-duration) lift_duration="$2" ;;
@@ -141,19 +151,23 @@ case "$robot" in
   *) echo "--robot only supports ultra" >&2; exit 2 ;;
 esac
 case "$capture_backend" in
-  x2-aimdk|orbbec-sdk|existing) ;;
-  *) echo "--capture-backend must be x2-aimdk, orbbec-sdk, or existing" >&2; exit 2 ;;
+  auto|x2-aimdk|orbbec-sdk|existing) ;;
+  *) echo "--capture-backend must be auto, x2-aimdk, orbbec-sdk, or existing" >&2; exit 2 ;;
+esac
+case "$image_rotation_deg" in
+  calibrated|auto|0|180) ;;
+  *) echo "--image-rotation-deg must be calibrated, auto, 0, or 180" >&2; exit 2 ;;
 esac
 if [[ -z "$verification_capture_backend" ]]; then
   if [[ "$capture_backend" == "existing" ]]; then
-    verification_capture_backend="x2-aimdk"
+    verification_capture_backend="auto"
   else
     verification_capture_backend="$capture_backend"
   fi
 fi
 case "$verification_capture_backend" in
-  x2-aimdk|orbbec-sdk) ;;
-  *) echo "--verification-capture-backend must be x2-aimdk or orbbec-sdk" >&2; exit 2 ;;
+  auto|x2-aimdk|orbbec-sdk) ;;
+  *) echo "--verification-capture-backend must be auto, x2-aimdk or orbbec-sdk" >&2; exit 2 ;;
 esac
 if [[ "$execute" == true && "$confirm_calibrated" != true ]]; then
   echo "Execution blocked: add --confirm-calibrated only after checking camera-to-robot calibration." >&2
@@ -179,6 +193,8 @@ trajectory="$repo_dir/output/planned_trajectory.json"
 planning_report="$repo_dir/output/planning_report.json"
 lift_trajectory="$repo_dir/output/planned_lift.json"
 lift_report="$repo_dir/output/planning_report_lift.json"
+return_trajectory="$repo_dir/output/planned_return.json"
+return_report="$repo_dir/output/planning_report_return.json"
 grasp_status="$repo_dir/output/grasp_status.json"
 
 echo "[1/3] RGB-D recognition: class=$target_class"
@@ -188,6 +204,7 @@ if [[ "$capture" == true ]]; then
     --classes "$target_class"
     --target-class "$target_class"
     --conf "$vision_conf"
+    --image-rotation-deg "$image_rotation_deg"
     --device 0
   )
   if [[ -n "$camera_calibration" ]]; then
@@ -216,7 +233,7 @@ print(f"Vision class gate passed: {actual}")
 PY
 
 echo
-echo "[2/3] Official IK and MuJoCo gate: Ultra/right OmniPicker"
+echo "[2/3] Headless official IK and MuJoCo gate: Ultra/right OmniPicker"
 "$repo_dir/run.sh" \
   --mode sim \
   --headless \
@@ -226,6 +243,8 @@ echo "[2/3] Official IK and MuJoCo gate: Ultra/right OmniPicker"
   --table-clearance "$table_clearance" \
   --lift-trajectory "$lift_trajectory" \
   --lift-report "$lift_report" \
+  --return-trajectory "$return_trajectory" \
+  --return-report "$return_report" \
   --lift-height "$lift_height" \
   --lift-duration "$lift_duration"
 
@@ -239,10 +258,12 @@ echo "[3/3] Visual grasp sequence: Ultra/right lift=${lift_duration}s/${lift_hei
 grasp_args=(
   --approach-trajectory "$trajectory"
   --lift-trajectory "$lift_trajectory"
+  --return-trajectory "$return_trajectory"
   --initial-vision "$vision_result"
   --target-class "$target_class"
   --capture-backend "$verification_capture_backend"
   --vision-confidence "$vision_conf"
+  --image-rotation-deg "$image_rotation_deg"
   --vision-runner "$repo_dir/run_vision.sh"
   --verification-timeout "$verification_timeout"
   --close-target-tolerance "$close_target_tolerance"
@@ -255,6 +276,7 @@ if [[ -n "$camera_calibration" ]]; then
   grasp_args+=(--camera-calibration "$camera_calibration")
 fi
 if [[ "$execute" == true ]]; then
+  ensure_x2_control_environment
   grasp_args+=(--execute --confirm-control-authority)
   if [[ "$assume_yes" != true ]]; then
     echo "Live sequence will move the right arm and OmniPicker. Type RUN to continue:"
@@ -263,6 +285,6 @@ if [[ "$execute" == true ]]; then
   fi
   ros2 run graspv2 x2_aimdk_hardware grasp "${grasp_args[@]}"
 else
-  PYTHONPATH="$repo_dir${PYTHONPATH:+:$PYTHONPATH}" \
-    /usr/bin/python3 -m graspv2.aimdk_hardware grasp "${grasp_args[@]}"
+  PYTHONPATH="$repo_dir/x2_ik_sdk/src:$repo_dir${PYTHONPATH:+:$PYTHONPATH}" \
+    "$planning_python" -m graspv2.aimdk_hardware grasp "${grasp_args[@]}"
 fi

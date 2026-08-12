@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -40,11 +41,20 @@ from .hardware_contract import (
     JointSetpoint,
     UpperBodyFrame,
     arm_setpoints,
+    inspect_joint_health,
     load_hardware_config,
     require_installed_omnipicker_side,
     resolve_joint_feedback,
     trajectory_sample_velocity,
     upper_body_arm_positions,
+)
+from .mc_animation import (
+    build_mc_animation,
+    build_mc_grasp_animation,
+    McGripperEvent,
+    validate_animation_trajectory_source,
+    validate_mc_animation_csv,
+    write_mc_animation_csv,
 )
 from .robot_profiles import (
     AVAILABLE_GRIPPER_SIDES,
@@ -54,11 +64,40 @@ from .robot_profiles import (
     get_robot_profile,
 )
 from .ros_logging import configure_fastdds_logging
-from .trajectory import JointTrajectory, load_trajectory, reverse_trajectory
+from .trajectory import (
+    JointTrajectory,
+    load_trajectory,
+    reverse_trajectory,
+    slice_trajectory,
+)
 
 
 class LiveHardwareError(RuntimeError):
     """Raised when live feedback or an AimDK interface is unsafe to use."""
+
+
+class UpperBodyUnavailableError(LiveHardwareError):
+    """Raised before motion when the selected SDK has no upper-body schema."""
+
+
+def _competition_omnipicker_sdk_argv(
+    sdk: Path,
+    side: str,
+    position: float,
+    duration_s: float,
+) -> tuple[str, ...]:
+    """Build the one official repository-SDK command used on competition X2."""
+
+    return (
+        "/usr/bin/python3",
+        str(sdk),
+        "--publish",
+        "--duration",
+        f"{duration_s:.9f}",
+        "position",
+        side,
+        f"{position:.9f}",
+    )
 
 
 @dataclass(frozen=True)
@@ -76,7 +115,7 @@ class _RosTypes:
     HandCommandArray: type
     HandStateArray: type
     HandType: type
-    UpperBodyCommandArray: type
+    UpperBodyCommandArray: type | None
     MessageHeader: type
     CommonRequest: type
     RequestHeader: type
@@ -113,7 +152,6 @@ def _load_ros_types() -> _RosTypes:
             MessageHeader,
             CommonRequest,
             RequestHeader,
-            UpperBodyCommandArray,
         )
         from aimdk_msgs.srv import (
             GetCurrentInputSource,
@@ -127,6 +165,12 @@ def _load_ros_types() -> _RosTypes:
             "/opt/ros/humble/setup.bash and the matching AimDK overlay first. "
             f"Import error: {error}"
         ) from error
+    try:
+        from aimdk_msgs.msg import UpperBodyCommandArray
+    except (ImportError, ModuleNotFoundError):
+        # The official AimDK v1.0.0 package removed this legacy MC split-mode
+        # message while retaining HAL, hand and preset-motion interfaces.
+        UpperBodyCommandArray = None
     return _RosTypes(
         rclpy=rclpy,
         Node=Node,
@@ -159,8 +203,12 @@ def _fields(message_type: type) -> set[str]:
     return set(message_type.get_fields_and_field_types())
 
 
-def require_aimdk_control_schema(types: _RosTypes) -> None:
-    """Accept the verified v0.9 state variants and v1.0 command contract."""
+def require_aimdk_control_schema(
+    types: _RosTypes,
+    *,
+    require_upper_body: bool = False,
+) -> None:
+    """Validate common AimDK interfaces and, when requested, legacy split mode."""
 
     expected = {
         types.JointCommand: {
@@ -196,14 +244,6 @@ def require_aimdk_control_schema(types: _RosTypes) -> None:
             "right_hands",
             "right_touch_sensors",
         },
-        types.UpperBodyCommandArray: {
-            "header",
-            "source",
-            "hand_sub_mode",
-            "head_pos",
-            "arm_pos",
-            "hand_pos",
-        },
         types.McActionCommand: {"action", "action_desc"},
         types.McInputAction: {"value"},
         types.McInputSource: {"name", "priority", "timeout"},
@@ -214,6 +254,28 @@ def require_aimdk_control_schema(types: _RosTypes) -> None:
             raise LiveHardwareError(
                 f"AimDK {message_type.__name__} schema mismatch: "
                 f"received {sorted(actual)}, expected {sorted(required)}"
+            )
+    if types.UpperBodyCommandArray is None:
+        if require_upper_body:
+            raise UpperBodyUnavailableError(
+                "this AimDK overlay does not provide UpperBodyCommandArray; "
+                "official v1.0.0 supports the MC animation fallback instead"
+            )
+    else:
+        required_upper_body = {
+            "header",
+            "source",
+            "hand_sub_mode",
+            "head_pos",
+            "arm_pos",
+            "hand_pos",
+        }
+        actual = _fields(types.UpperBodyCommandArray)
+        if actual != required_upper_body:
+            raise LiveHardwareError(
+                "AimDK UpperBodyCommandArray schema mismatch: "
+                f"received {sorted(actual)}, expected "
+                f"{sorted(required_upper_body)}"
             )
     joint_state_array = _fields(types.JointStateArray)
     if joint_state_array != {"header", "state", "joints"}:
@@ -281,6 +343,8 @@ def build_omnipicker_message(
     command.effort = tuning.effort
 
     message = types.HandCommandArray()
+    message.header = types.MessageHeader()
+    message.header.frame_id = "hand_command"
     # 0 means no command/device for this message; 2 means OmniPicker/gripper.
     message.left_hand_type = types.HandType(value=0)
     message.right_hand_type = types.HandType(value=0)
@@ -298,6 +362,11 @@ def build_upper_body_message(
     stamp: object | None = None,
 ):
     """Build the official fixed-width MC upper-body split command."""
+
+    if types.UpperBodyCommandArray is None:
+        raise UpperBodyUnavailableError(
+            "UpperBodyCommandArray is unavailable in the selected AimDK overlay"
+        )
 
     if len(frame.head_positions) != 2:
         raise HardwareContractError("upper-body head command requires 2 values")
@@ -377,6 +446,25 @@ def _largest_tracking_error(
     return abs(actual - expected), joint_name, actual, expected
 
 
+def _validate_return_endpoint(
+    profile: RobotProfile,
+    trajectory: JointTrajectory,
+    *,
+    tolerance_rad: float = 1e-6,
+) -> None:
+    """Require the independently planned return to end at the MC default pose."""
+
+    default_by_name = dict(zip(profile.arm_pos_order, profile.mc_start_arm_pos()))
+    error = max(
+        abs(value - default_by_name[name])
+        for name, value in zip(trajectory.joint_names, trajectory.positions[-1])
+    )
+    if error > tolerance_rad:
+        raise LiveHardwareError(
+            f"return trajectory ends {error:.6f} rad from the MC default arm pose"
+        )
+
+
 def _wait_for_control_services(
     required: Sequence[tuple[object, str]],
     timeout_s: float,
@@ -435,6 +523,20 @@ def create_aimdk_hardware_node(
             }
             self.state_received_at: dict[str, float] = {}
             self.upper_body_sequence = 0
+            self.upper_body_command_count = 0
+            self.omnipicker_command_count = 0
+            # Activation can publish HOLD frames before the requested path
+            # starts.  Track planned motion separately so those setup frames
+            # do not incorrectly suppress the safe animation fallback.
+            self.planned_motion_started = False
+            self.runtime_profile = os.environ.get(
+                "GRASPV2_RUNTIME_PROFILE", "test"
+            )
+            self.omnipicker_sdk = (
+                Path(__file__).resolve().parents[1]
+                / "omnipicker_hand_student.py"
+            )
+            self.packed_temperature_notice_emitted = False
             self.split_mode_entered = False
             self.command_publishers = {
                 "arm": self.create_publisher(
@@ -451,12 +553,13 @@ def create_aimdk_hardware_node(
                     topics.hand_command,
                     hand_publisher_qos,
                 ),
-                "upper-body": self.create_publisher(
+            }
+            if types.UpperBodyCommandArray is not None:
+                self.command_publishers["upper-body"] = self.create_publisher(
                     types.UpperBodyCommandArray,
                     topics.upper_body_command,
                     publisher_qos,
-                ),
-            }
+                )
             self.get_mode_client = self.create_client(
                 types.GetMcAction, config.services.get_mc_action
             )
@@ -506,6 +609,11 @@ def create_aimdk_hardware_node(
             return state
 
         def _wait_for_command_consumer(self, group: str) -> None:
+            if group == "upper-body" and types.UpperBodyCommandArray is None:
+                raise UpperBodyUnavailableError(
+                    "UpperBodyCommandArray is unavailable in the selected "
+                    "AimDK overlay"
+                )
             publisher = self.command_publishers[group]
             deadline = time.monotonic() + config.upper_body.feedback_timeout_s
             while publisher.get_subscription_count() < 1 and time.monotonic() < deadline:
@@ -819,21 +927,30 @@ def create_aimdk_hardware_node(
                     raise LiveHardwareError(
                         f"arm is moving at {fastest:.3f} rad/s; limit is {limit:.3f}"
                     )
-            for joint in ordered:
-                if hasattr(joint, "error_code") and int(joint.error_code) != 0:
-                    raise LiveHardwareError(
-                        f"joint {joint.name or '<unnamed>'} error_code={joint.error_code}"
-                    )
-                temperatures = [
-                    int(getattr(joint, field))
-                    for field in ("coil_temp", "motor_temp")
-                    if hasattr(joint, field)
-                ]
-                if temperatures and max(temperatures) >= config.upper_body.maximum_temperature_c:
-                    raise LiveHardwareError(
-                        f"joint {joint.name or '<unnamed>'} reached "
-                        f"{max(temperatures)} C"
-                    )
+            health = inspect_joint_health(ordered)
+            if health.error_codes:
+                name, code = health.error_codes[0]
+                raise LiveHardwareError(f"joint {name} error_code={code}")
+            if (
+                health.hottest_temperature_c is not None
+                and health.hottest_temperature_c
+                >= config.upper_body.maximum_temperature_c
+            ):
+                raise LiveHardwareError(
+                    "arm reached "
+                    f"{health.hottest_temperature_c} C"
+                )
+            if (
+                health.packed_legacy_temperatures
+                and not self.packed_temperature_notice_emitted
+            ):
+                self.get_logger().warning(
+                    "AimDK JointState error_code bytes match the legacy X2 "
+                    "coil/motor temperature layout; treating the frame as "
+                    f"temperature feedback (hottest="
+                    f"{health.hottest_temperature_c} C)"
+                )
+                self.packed_temperature_notice_emitted = True
             return positions
 
         def _assert_head_health(self) -> tuple[float, float]:
@@ -911,6 +1028,10 @@ def create_aimdk_hardware_node(
             self, profile: RobotProfile, component: str, transport: str
         ) -> None:
             if component in {"all", "upper-body"}:
+                if transport == "upper-body":
+                    require_aimdk_control_schema(
+                        types, require_upper_body=True
+                    )
                 positions = self._assert_arm_health(
                     profile, require_stationary=True
                 )
@@ -963,13 +1084,94 @@ def create_aimdk_hardware_node(
             )
             self.upper_body_sequence = (self.upper_body_sequence + 1) % (2**32)
             self.command_publishers["upper-body"].publish(message)
+            self.upper_body_command_count += 1
 
         def command_omnipicker(self, side: str, position: float) -> None:
             message = build_omnipicker_message(types, config, side, position)
             message.header.stamp = self.get_clock().now().to_msg()
             self.command_publishers["hand"].publish(message)
+            self.omnipicker_command_count += 1
+
+        def _competition_omnipicker_command(
+            self,
+            side: str,
+            position: float,
+            duration_s: float,
+            *,
+            hold_cycle: Callable[[], None] | None = None,
+        ) -> None:
+            """Run the repository OmniPicker SDK, optionally holding MC control."""
+
+            require_installed_omnipicker_side(config, side)
+            duration = float(duration_s)
+            if duration <= 0.0:
+                raise ValueError("OmniPicker command duration must be positive")
+            if not self.omnipicker_sdk.is_file():
+                raise LiveHardwareError(
+                    "competition OmniPicker SDK is missing: "
+                    f"{self.omnipicker_sdk}"
+                )
+            command = _competition_omnipicker_sdk_argv(
+                self.omnipicker_sdk,
+                side,
+                position,
+                duration,
+            )
+            self.omnipicker_command_count += 1
+            try:
+                process = subprocess.Popen(command, cwd=self.omnipicker_sdk.parent)
+            except OSError as error:
+                raise LiveHardwareError(
+                    f"competition OmniPicker SDK could not start: {error}"
+                ) from error
+            deadline = time.monotonic() + duration + 5.0
+            try:
+                while process.poll() is None:
+                    if time.monotonic() >= deadline:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=1.0)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=1.0)
+                        raise LiveHardwareError(
+                            "competition OmniPicker SDK timed out after "
+                            f"{duration + 5.0:.1f} s"
+                        )
+                    if hold_cycle is None:
+                        time.sleep(0.02)
+                    else:
+                        hold_cycle()
+                return_code = process.wait()
+            except Exception:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=1.0)
+                raise
+            if return_code != 0:
+                raise LiveHardwareError(
+                    "competition OmniPicker SDK failed with status "
+                    f"{return_code}"
+                )
+            self.get_logger().info(
+                "Repository omnipicker_hand_student.py completed: "
+                f"{side} target={position:.3f}, duration={duration:.3f} s"
+            )
 
         def execute_omnipicker(self, side: str, position: float) -> None:
+            if self.runtime_profile == "competition":
+                self._check_omnipicker_feedback_if_available(side)
+                self._competition_omnipicker_command(
+                    side,
+                    position,
+                    config.omnipicker.publish_duration_s,
+                )
+                self._check_omnipicker_feedback_if_available(side)
+                return
             self._wait_for_command_consumer("hand")
             self._check_omnipicker_feedback_if_available(side)
             period = 1.0 / config.omnipicker.publish_rate_hz
@@ -1011,6 +1213,7 @@ def create_aimdk_hardware_node(
         ) -> None:
             """Execute through MC split mode while MC retains balance control."""
 
+            require_aimdk_control_schema(types, require_upper_body=True)
             self._wait_for_mode_services()
             base = self._assert_arm_health(profile, require_stationary=True)
             head = self._assert_head_health()
@@ -1098,6 +1301,9 @@ def create_aimdk_hardware_node(
                         profile, profile_positions
                     ),
                 )
+                # Set this immediately before the first requested path frame,
+                # after every validation that can still safely fall back.
+                self.planned_motion_started = True
                 self.command_upper_body(frame)
                 last_frame = frame
                 rclpy.spin_once(self, timeout_sec=0.0)
@@ -1156,10 +1362,33 @@ def create_aimdk_hardware_node(
             frame: UpperBodyFrame,
             side: str,
             position: float,
+            *,
+            duration_s: float | None = None,
         ) -> None:
             self._check_omnipicker_feedback_if_available(side)
             period = 1.0 / config.upper_body.command_rate_hz
-            deadline = time.monotonic() + config.omnipicker.publish_duration_s
+            duration = (
+                config.omnipicker.publish_duration_s
+                if duration_s is None
+                else float(duration_s)
+            )
+            if not duration > 0.0:
+                raise ValueError("OmniPicker command duration must be positive")
+            if self.runtime_profile == "competition":
+
+                def hold_cycle() -> None:
+                    self._publish_hold_cycle(frame, period)
+                    self._assert_arm_health(profile, require_stationary=False)
+
+                self._competition_omnipicker_command(
+                    side,
+                    position,
+                    duration,
+                    hold_cycle=hold_cycle,
+                )
+                self._check_omnipicker_feedback_if_available(side)
+                return
+            deadline = time.monotonic() + duration
             frames = 0
             while time.monotonic() < deadline:
                 cycle = time.monotonic()
@@ -1174,7 +1403,30 @@ def create_aimdk_hardware_node(
             self._check_omnipicker_feedback_if_available(side)
             self.get_logger().info(
                 f"{side} OmniPicker target={position:.3f}; published {frames} "
-                "frames while holding upper-body pose"
+                f"frames over {duration:.3f} s while holding upper-body pose"
+            )
+
+        def _hold_upper_body_pose(
+            self,
+            profile: RobotProfile,
+            frame: UpperBodyFrame,
+            duration_s: float,
+            *,
+            label: str,
+        ) -> None:
+            """Hold a planned endpoint for one deterministic state-machine phase."""
+
+            duration = float(duration_s)
+            if not duration > 0.0:
+                raise ValueError("upper-body hold duration must be positive")
+            period = 1.0 / config.upper_body.command_rate_hz
+            deadline = time.monotonic() + duration
+            while time.monotonic() < deadline:
+                self._publish_hold_cycle(frame, period)
+                self._assert_arm_health(profile, require_stationary=False)
+                self._assert_head_health()
+            self.get_logger().info(
+                f"MC upper-body {label} hold completed in {duration:.3f} s"
             )
 
         def _verify_while_holding(
@@ -1233,15 +1485,20 @@ def create_aimdk_hardware_node(
             profile: RobotProfile,
             approach: JointTrajectory,
             lift: JointTrajectory,
+            return_to_default: JointTrajectory,
             metadata: GraspPlanMetadata,
             verify_closed: Callable[[], VisualCheckResult],
             verify_lifted: Callable[[], VisualCheckResult],
             *,
             verification_timeout_s: float,
         ) -> tuple[VisualCheckResult, VisualCheckResult]:
-            """Execute open/approach/close/check/lift/check/release/return."""
+            """Execute the same staged side-grasp state machine as MuJoCo."""
 
+            # The MC fallback mirrors these physical arm/hand phases, but its
+            # atomic playback cannot pause at the two conditional vision gates.
+            require_aimdk_control_schema(types, require_upper_body=True)
             validate_trajectory_continuity(approach, lift)
+            validate_trajectory_continuity(lift, return_to_default)
             require_installed_omnipicker_side(config, metadata.side)
             if metadata.robot_profile != profile.name:
                 raise LiveHardwareError(
@@ -1250,10 +1507,42 @@ def create_aimdk_hardware_node(
             if verification_timeout_s <= 0.0:
                 raise ValueError("verification_timeout_s must be positive")
             expected_joints = set(profile.right_arm_joints)
-            if set(approach.joint_names) != expected_joints:
+            if any(
+                set(item.joint_names) != expected_joints
+                for item in (approach, lift, return_to_default)
+            ):
                 raise LiveHardwareError(
                     "grasp trajectories do not command exactly the selected arm"
                 )
+            _validate_return_endpoint(profile, return_to_default)
+            if not 0.0 < metadata.pregrasp_duration_s < approach.duration:
+                raise LiveHardwareError(
+                    "pregrasp/descent boundary is outside the approach trajectory"
+                )
+
+            move_above = slice_trajectory(
+                approach, 0.0, metadata.pregrasp_duration_s
+            )
+            vertical_descent = slice_trajectory(
+                approach, metadata.pregrasp_duration_s, approach.duration
+            )
+            controlled_lower = slice_trajectory(
+                return_to_default,
+                0.0,
+                metadata.controlled_lower_duration_s,
+            )
+            open_hand_retreat = slice_trajectory(
+                return_to_default,
+                metadata.controlled_lower_duration_s,
+                metadata.controlled_lower_duration_s
+                + metadata.open_hand_retreat_duration_s,
+            )
+            closed_return = slice_trajectory(
+                return_to_default,
+                metadata.controlled_lower_duration_s
+                + metadata.open_hand_retreat_duration_s,
+                return_to_default.duration,
+            )
 
             self._wait_for_mode_services()
             self._wait_for_command_consumer("hand")
@@ -1262,41 +1551,91 @@ def create_aimdk_hardware_node(
             self._validate_upper_body_start(profile, approach, base)
             self._require_stable_mode()
             self.configure_input_source()
-            # Open before changing MC mode, following the competition hand contract.
-            self.execute_omnipicker(
-                metadata.side,
-                config.omnipicker.open_position,
-            )
-            base = self._assert_arm_health(profile, require_stationary=True)
 
-            reverse_lift = reverse_trajectory(lift)
             reverse_approach = reverse_trajectory(approach)
+            failed_open_retreat_duration = (
+                approach.duration - metadata.pregrasp_duration_s
+            )
+            failed_open_retreat = slice_trajectory(
+                reverse_approach,
+                0.0,
+                failed_open_retreat_duration,
+            )
+            failed_closed_return = slice_trajectory(
+                reverse_approach,
+                failed_open_retreat_duration,
+                reverse_approach.duration,
+            )
             closed_check: VisualCheckResult | None = None
             lifted_check: VisualCheckResult | None = None
             visual_failure: VisualVerificationError | None = None
-            approach_frame: UpperBodyFrame | None = None
+            pregrasp_frame: UpperBodyFrame | None = None
+            grasp_frame: UpperBodyFrame | None = None
             lift_frame: UpperBodyFrame | None = None
             try:
+                # Prove that the legacy split action exists before starting
+                # the planned arm path. Activation HOLD frames and the initial
+                # empty-gripper command still leave animation fallback safe.
+                if self.runtime_profile == "competition":
+                    # Close the empty gripper before MC source activation so
+                    # the standalone SDK cannot starve upper-body keepalives.
+                    self.execute_omnipicker(
+                        metadata.side,
+                        config.omnipicker.closed_position,
+                    )
                 self._enter_split_mode()
                 self._wait_for_command_consumer("upper-body")
                 self._activate_input_source(profile, base, head)
-                approach_frame = self._run_upper_body_trajectory(
+                # MuJoCo starts with an empty closed gripper while moving above
+                # the target. Establish the same state only after MC ownership
+                # has been accepted.
+                if self.runtime_profile != "competition":
+                    self.execute_omnipicker(
+                        metadata.side,
+                        config.omnipicker.closed_position,
+                    )
+                base = self._assert_arm_health(
                     profile,
-                    approach,
+                    require_stationary=True,
+                )
+                pregrasp_frame = self._run_upper_body_trajectory(
+                    profile,
+                    move_above,
                     base,
                     head,
-                    label="approach",
+                    label="move-above-object",
                 )
                 self._command_omnipicker_while_holding(
                     profile,
-                    approach_frame,
+                    pregrasp_frame,
                     metadata.side,
-                    config.omnipicker.closed_position,
+                    metadata.preopen_position,
+                    duration_s=metadata.open_duration_s,
+                )
+                grasp_frame = self._run_upper_body_trajectory(
+                    profile,
+                    vertical_descent,
+                    base,
+                    head,
+                    label="vertical-descent",
+                )
+                self._command_omnipicker_while_holding(
+                    profile,
+                    grasp_frame,
+                    metadata.side,
+                    metadata.grip_position,
+                    duration_s=metadata.close_duration_s,
+                )
+                self._hold_upper_body_pose(
+                    profile,
+                    grasp_frame,
+                    metadata.grasp_settle_duration_s,
+                    label="grasp-settle",
                 )
                 try:
                     closed_check = self._verify_while_holding(
                         profile,
-                        approach_frame,
+                        grasp_frame,
                         verify_closed,
                         timeout_s=verification_timeout_s,
                         label="closed-grasp",
@@ -1323,28 +1662,63 @@ def create_aimdk_hardware_node(
                     except VisualVerificationError as error:
                         visual_failure = error
 
-                # Controlled visual failures use the same verified path to recover.
+                # A successful lift is held for inspection, then reversed while
+                # the object remains gripped.  Release occurs only after the
+                # object has been placed back at the verified grasp position.
                 if lift_frame is not None:
-                    approach_frame = self._run_upper_body_trajectory(
+                    self._hold_upper_body_pose(
                         profile,
-                        reverse_lift,
+                        lift_frame,
+                        metadata.lifted_hold_duration_s,
+                        label="lifted-hold",
+                    )
+                    place_frame = self._run_upper_body_trajectory(
+                        profile,
+                        controlled_lower,
                         base,
                         head,
-                        label="lower",
+                        label="controlled-lower",
                     )
-                assert approach_frame is not None
+                    retreat = open_hand_retreat
+                    final_return = closed_return
+                else:
+                    assert grasp_frame is not None
+                    place_frame = grasp_frame
+                    retreat = failed_open_retreat
+                    final_return = failed_closed_return
                 self._command_omnipicker_while_holding(
                     profile,
-                    approach_frame,
+                    place_frame,
                     metadata.side,
                     config.omnipicker.open_position,
+                    duration_s=metadata.release_duration_s,
+                )
+                self._hold_upper_body_pose(
+                    profile,
+                    place_frame,
+                    metadata.place_settle_duration_s,
+                    label="place-settle",
+                )
+                pregrasp_frame = self._run_upper_body_trajectory(
+                    profile,
+                    retreat,
+                    base,
+                    head,
+                    label="open-hand-vertical-retreat",
+                )
+                self._command_omnipicker_while_holding(
+                    profile,
+                    pregrasp_frame,
+                    metadata.side,
+                    config.omnipicker.closed_position,
+                    duration_s=metadata.reclose_duration_s,
                 )
                 self._run_upper_body_trajectory(
                     profile,
-                    reverse_approach,
+                    final_return,
                     base,
                     head,
-                    label="retreat",
+                    label="return-to-default",
                 )
                 if visual_failure is not None:
                     raise visual_failure
@@ -1500,6 +1874,31 @@ def _parser() -> argparse.ArgumentParser:
         default="upper-body",
         help="MC split mode (default) or direct low-level HAL publication",
     )
+    trajectory.add_argument(
+        "--upper-body-fallback",
+        choices=("animation", "none"),
+        default="animation",
+        help=(
+            "when upper-body fails before planned trajectory motion starts, "
+            "automatically "
+            "run the same verified trajectory through MC animation (default: "
+            "animation); use none to fail closed"
+        ),
+    )
+    trajectory.add_argument(
+        "--fallback-animation-output",
+        type=Path,
+        default=Path(__file__).resolve().parents[1]
+        / "output"
+        / "upper_body_fallback.csv",
+        help="generated hand-free MC CSV used only by the safe fallback",
+    )
+    trajectory.add_argument(
+        "--fallback-speed-scale",
+        type=float,
+        default=0.5,
+        help="fallback animation trajectory speed scale in (0, 1]",
+    )
     trajectory.add_argument("--execute", action="store_true")
     trajectory.add_argument("--confirm-control-authority", action="store_true")
 
@@ -1525,15 +1924,22 @@ def _parser() -> argparse.ArgumentParser:
     grasp.add_argument("--robot", choices=tuple(PROFILES), default="ultra")
     grasp.add_argument("--approach-trajectory", type=Path, required=True)
     grasp.add_argument("--lift-trajectory", type=Path, required=True)
+    grasp.add_argument("--return-trajectory", type=Path, required=True)
     grasp.add_argument("--initial-vision", type=Path, required=True)
     grasp.add_argument("--target-class", required=True)
     grasp.add_argument(
         "--capture-backend",
-        choices=("x2-aimdk", "orbbec-sdk"),
-        default="x2-aimdk",
+        choices=("auto", "x2-aimdk", "orbbec-sdk"),
+        default="auto",
     )
     grasp.add_argument("--camera-calibration", type=Path)
     grasp.add_argument("--vision-confidence", type=float, default=0.20)
+    grasp.add_argument(
+        "--image-rotation-deg",
+        choices=("calibrated", "auto", "0", "180"),
+        default="auto",
+        help="RGB-D orientation mode forwarded to every visual verification capture",
+    )
     grasp.add_argument(
         "--vision-runner",
         type=Path,
@@ -1558,6 +1964,34 @@ def _parser() -> argparse.ArgumentParser:
     grasp.add_argument("--lifted-target-tolerance", type=float, default=0.10)
     grasp.add_argument("--minimum-lift-ratio", type=float, default=0.60)
     grasp.add_argument("--maximum-lateral-drift", type=float, default=0.08)
+    grasp.add_argument(
+        "--upper-body-fallback",
+        choices=("animation", "none"),
+        default="animation",
+        help=(
+            "if upper-body grasp setup fails before planned trajectory motion "
+            "starts, "
+            "run the complete verified grasp/lift/place/return sequence through "
+            "MC animation (default: animation); use none to fail closed"
+        ),
+    )
+    grasp.add_argument(
+        "--fallback-animation-output",
+        type=Path,
+        default=Path(__file__).resolve().parents[1]
+        / "output"
+        / "grasp_fallback.csv",
+        help="generated MC CSV used only by the pre-motion grasp fallback",
+    )
+    grasp.add_argument(
+        "--fallback-speed-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "grasp fallback motion speed scale in (0, 1] (default: 1.0, "
+            "matching the verified simulation timing)"
+        ),
+    )
     grasp.add_argument("--execute", action="store_true")
     grasp.add_argument("--confirm-control-authority", action="store_true")
     return parser
@@ -1605,6 +2039,8 @@ def _capture_visual_observation(
         args.target_class,
         "--conf",
         str(args.vision_confidence),
+        "--image-rotation-deg",
+        args.image_rotation_deg,
         "--device",
         "0",
     ]
@@ -1637,6 +2073,7 @@ def _execute_visual_grasp(
     profile: RobotProfile,
     approach: JointTrajectory,
     lift: JointTrajectory,
+    return_to_default: JointTrajectory,
     metadata: GraspPlanMetadata,
 ) -> None:
     settings = VisualVerificationConfig(
@@ -1657,7 +2094,7 @@ def _execute_visual_grasp(
         observation = _capture_visual_observation(args, "after_close")
         result = verify_closed_observation(
             observation,
-            metadata.grasp_target_world_m,
+            metadata.object_center_world_m,
             settings,
         )
         closed_observation.append(observation)
@@ -1696,6 +2133,7 @@ def _execute_visual_grasp(
             profile,
             approach,
             lift,
+            return_to_default,
             metadata,
             verify_closed,
             verify_lifted,
@@ -1722,6 +2160,42 @@ def _execute_visual_grasp(
     )
 
 
+def _animation_fallback_eligible(
+    args: argparse.Namespace,
+    node: object | None,
+    fallback_animation: Path | None,
+) -> bool:
+    """Allow fallback until the requested arm trajectory actually starts."""
+
+    competition_before_node = bool(
+        os.environ.get("GRASPV2_RUNTIME_PROFILE") == "competition"
+        and node is None
+    )
+    if node is None:
+        before_planned_motion = competition_before_node
+    else:
+        planned_motion_started = getattr(node, "planned_motion_started", None)
+        if planned_motion_started is None:
+            # Preserve the conservative contract for older adapters and the
+            # deliberately minimal test doubles that do not expose the marker.
+            before_planned_motion = bool(
+                getattr(node, "upper_body_command_count", 0) == 0
+                and getattr(node, "omnipicker_command_count", 0) == 0
+            )
+        else:
+            before_planned_motion = not bool(planned_motion_started)
+    return bool(
+        args.operation in {"trajectory", "grasp"}
+        and (
+            args.operation == "grasp"
+            or getattr(args, "transport", None) == "upper-body"
+        )
+        and args.upper_body_fallback == "animation"
+        and fallback_animation is not None
+        and before_planned_motion
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -1730,8 +2204,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         profile: RobotProfile | None = None
         trajectory: JointTrajectory | None = None
         lift_trajectory: JointTrajectory | None = None
+        return_trajectory: JointTrajectory | None = None
         grasp_metadata: GraspPlanMetadata | None = None
         position: float | None = None
+        fallback_animation: Path | None = None
+        fallback_initial_gripper_position: float | None = None
+        fallback_gripper_events: tuple[McGripperEvent, ...] = ()
         if args.operation in {"preflight", "trajectory", "grasp"}:
             profile = get_robot_profile(args.robot)
         if args.operation == "trajectory":
@@ -1741,6 +2219,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.trajectory,
                 maximum_allowed_velocity=profile.maximum_velocity_rad_s + 1e-6,
             )
+            if (
+                args.transport == "upper-body"
+                and args.upper_body_fallback == "animation"
+            ):
+                validate_animation_trajectory_source(args.trajectory, profile)
+                animation = build_mc_animation(
+                    trajectory,
+                    speed_scale=args.fallback_speed_scale,
+                    maximum_output_velocity=profile.maximum_velocity_rad_s,
+                )
+                fallback_animation = write_mc_animation_csv(
+                    animation,
+                    args.fallback_animation_output,
+                )
+                fallback_info = validate_mc_animation_csv(
+                    fallback_animation,
+                    maximum_velocity=profile.maximum_velocity_rad_s,
+                )
             if not args.execute:
                 topic = (
                     config.topics.upper_body_command
@@ -1753,7 +2249,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"{trajectory.maximum_velocity:.3f} rad/s"
                 )
                 print(f"Transport: {args.transport}, topic={topic}")
-                print("Robot control: DISABLED (add both execution flags to publish).")
+                if fallback_animation is not None:
+                    print(
+                        "Safe fallback: MC animation prepared at "
+                        f"{fallback_animation} "
+                        f"({fallback_info.frame_count} frames, "
+                        f"{fallback_info.duration_s:.3f} s); it is eligible "
+                        "only before planned trajectory motion starts"
+                    )
+                print(
+                    "Robot control: DISABLED (add both execution flags to publish)."
+                )
                 return 0
         elif args.operation == "omnipicker":
             _require_execution_confirmation(args)
@@ -1763,7 +2269,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"OmniPicker dry-run OK: side={args.side}, position={position:.3f}, "
                     f"topic={config.topics.hand_command}"
                 )
-                print("Robot control: DISABLED (add both execution flags to publish).")
+                print(
+                    "Robot control: DISABLED (add both execution flags to publish)."
+                )
                 return 0
         elif args.operation == "grasp":
             _require_execution_confirmation(args)
@@ -1776,10 +2284,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.lift_trajectory,
                 maximum_allowed_velocity=profile.maximum_velocity_rad_s + 1e-6,
             )
+            return_trajectory = load_trajectory(
+                args.return_trajectory,
+                maximum_allowed_velocity=profile.maximum_velocity_rad_s + 1e-6,
+            )
             validate_trajectory_continuity(trajectory, lift_trajectory)
+            validate_trajectory_continuity(lift_trajectory, return_trajectory)
+            _validate_return_endpoint(profile, return_trajectory)
             grasp_metadata = load_grasp_plan_metadata(
                 args.approach_trajectory,
                 args.lift_trajectory,
+                args.return_trajectory,
             )
             require_installed_omnipicker_side(config, grasp_metadata.side)
             if grasp_metadata.robot_profile != profile.name:
@@ -1803,9 +2318,34 @@ def main(argv: Sequence[str] | None = None) -> int:
             ).validate()
             verify_initial_observation(
                 initial_observation,
-                grasp_metadata.grasp_target_world_m,
+                grasp_metadata.object_center_world_m,
                 settings,
             )
+            if args.upper_body_fallback == "animation":
+                validate_animation_trajectory_source(
+                    args.approach_trajectory,
+                    profile,
+                )
+                animation = build_mc_grasp_animation(
+                    trajectory,
+                    lift_trajectory,
+                    return_trajectory,
+                    grasp_metadata,
+                    speed_scale=args.fallback_speed_scale,
+                    maximum_output_velocity=profile.maximum_velocity_rad_s,
+                )
+                fallback_initial_gripper_position = (
+                    animation.initial_gripper_position
+                )
+                fallback_gripper_events = animation.gripper_events
+                fallback_animation = write_mc_animation_csv(
+                    animation,
+                    args.fallback_animation_output,
+                )
+                fallback_info = validate_mc_animation_csv(
+                    fallback_animation,
+                    maximum_velocity=profile.maximum_velocity_rad_s,
+                )
             if args.verification_timeout <= 0.0:
                 raise HardwareContractError("--verification-timeout must be positive")
             if not 0.0 <= args.vision_confidence <= 1.0:
@@ -1825,19 +2365,66 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"robot={profile.name}, side={grasp_metadata.side}, "
                     f"approach={trajectory.duration:.3f} s, "
                     f"lift={lift_trajectory.duration:.3f} s/"
-                    f"{grasp_metadata.lift_height_m:.3f} m"
+                    f"{grasp_metadata.lift_height_m:.3f} m, "
+                    f"return={return_trajectory.duration:.3f} s, "
+                    f"preopen={grasp_metadata.preopen_position:.3f}, "
+                    f"grip={grasp_metadata.grip_position:.3f}"
                 )
                 print(
-                    "Sequence: open -> approach -> close -> visual gate -> "
-                    "two-second lift -> visual no-drop gate -> lower -> release -> retreat"
+                    "Sequence: closed robot-side safe staging -> high transfer "
+                    "-> fully open -> vertical descent -> radius close -> "
+                    "visual gate -> lift -> visual no-drop gate -> hold -> "
+                    "controlled lower -> placed release -> open retreat -> "
+                    "close-empty -> verified return"
                 )
+                if fallback_animation is not None:
+                    print(
+                        "Safe pre-motion fallback: MC animation prepared at "
+                        f"{fallback_animation} "
+                        f"({fallback_info.frame_count} frames, "
+                        f"{fallback_info.duration_s:.3f} s, "
+                        f"{len(fallback_gripper_events)} synchronized hand "
+                        "events). It is eligible only before planned arm "
+                        "trajectory motion starts; setup HOLD frames and the "
+                        "initial empty-gripper command remain recoverable. Its "
+                        "physical phases match the "
+                        "verified simulation sequence."
+                    )
                 print("Robot control/capture: DISABLED (add both execution flags).")
                 return 0
     except (OSError, ValueError, RuntimeError) as error:
         parser.error(str(error))
 
+    if (
+        os.environ.get("GRASPV2_RUNTIME_PROFILE") == "competition"
+        and args.operation == "omnipicker"
+    ):
+        assert position is not None
+        sdk = Path(__file__).resolve().parents[1] / "omnipicker_hand_student.py"
+        if not sdk.is_file():
+            print(
+                f"Competition OmniPicker SDK is missing: {sdk}",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            "Competition profile: executing the right OmniPicker through "
+            f"{sdk.name}, target={position:.3f}"
+        )
+        return subprocess.run(
+            _competition_omnipicker_sdk_argv(
+                sdk,
+                "right",
+                position,
+                config.omnipicker.publish_duration_s,
+            ),
+            cwd=sdk.parent,
+            check=False,
+        ).returncode
+
     node = None
     types = None
+    fallback_reason: str | None = None
     try:
         types = _load_ros_types()
         configure_fastdds_logging()
@@ -1861,6 +2448,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 profile is not None
                 and trajectory is not None
                 and lift_trajectory is not None
+                and return_trajectory is not None
                 and grasp_metadata is not None
             )
             _execute_visual_grasp(
@@ -1869,19 +2457,117 @@ def main(argv: Sequence[str] | None = None) -> int:
                 profile,
                 trajectory,
                 lift_trajectory,
+                return_trajectory,
                 grasp_metadata,
             )
-    except (HardwareContractError, LiveHardwareError, RuntimeError) as error:
-        if node is not None:
-            node.get_logger().error(f"AimDK hardware operation aborted: {error}")
+    except Exception as error:
+        # A competition overlay/service can fail with vendor-specific exception
+        # types. Treat every ordinary runtime failure uniformly; the fallback
+        # gate below still refuses replay once planned motion has begun.
+        can_fallback = _animation_fallback_eligible(
+            args,
+            node,
+            fallback_animation,
+        )
+        if can_fallback:
+            fallback_reason = str(error)
+            if node is not None:
+                node.get_logger().warning(
+                    "MC upper-body failed before planned trajectory motion "
+                    "started; "
+                    f"switching to the prepared animation fallback: {error}"
+                )
+            else:
+                print(
+                    "Competition local upper-body initialization failed before "
+                    "creating any publisher; switching to the prepared MC "
+                    f"animation fallback: {error}",
+                    file=sys.stderr,
+                )
         else:
-            print(f"AimDK hardware operation aborted: {error}", file=sys.stderr)
-        return 1
+            if node is not None:
+                command_count = getattr(node, "upper_body_command_count", 0)
+                hand_command_count = getattr(node, "omnipicker_command_count", 0)
+                planned_motion_started = bool(
+                    getattr(node, "planned_motion_started", False)
+                )
+                suffix = (
+                    "; animation fallback blocked after planned motion started "
+                    "with "
+                    f"{command_count} upper-body and {hand_command_count} "
+                    "OmniPicker command(s)"
+                    if args.operation in {"trajectory", "grasp"}
+                    and planned_motion_started
+                    else ""
+                )
+                node.get_logger().error(
+                    f"AimDK hardware operation aborted: {error}{suffix}"
+                )
+            else:
+                print(
+                    f"AimDK hardware operation aborted: {error}",
+                    file=sys.stderr,
+                )
+            return 1
     finally:
         if node is not None:
             node.destroy_node()
         if types is not None and types.rclpy.ok():
             types.rclpy.shutdown()
+    if fallback_reason is not None:
+        assert fallback_animation is not None
+        backend = Path(__file__).resolve().parents[1] / "tools" / "animation_backend.sh"
+        if not backend.is_file():
+            print(
+                "Animation fallback could not start because the backend is "
+                f"missing: {backend}",
+                file=sys.stderr,
+            )
+            return 1
+        if os.environ.get("GRASPV2_RUNTIME_PROFILE") == "competition":
+            print(
+                "The competition local upper-body interface failed before "
+                "planned trajectory motion started; starting the complete local MC "
+                "animation fallback: safe staging, open, descent, radius "
+                "close, lift, hold, controlled lower, placed release, open "
+                f"retreat, empty close and verified return ({fallback_reason}).",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "Upper-body control aborted before planned trajectory motion "
+                "started; "
+                "starting the complete MC grasp animation fallback. The "
+                "fallback performs safe staging, open, descent, radius close, "
+                "lift, hold, controlled lower, placed release, open retreat, "
+                f"empty close and verified return ({fallback_reason}).",
+                file=sys.stderr,
+            )
+        backend_command = [
+            str(backend),
+            "--animation",
+            str(fallback_animation),
+            "--yes",
+        ]
+        if fallback_initial_gripper_position is not None:
+            backend_command.extend(
+                [
+                    "--initial-gripper-position",
+                    f"{fallback_initial_gripper_position:.9f}",
+                ]
+            )
+        for event in fallback_gripper_events:
+            backend_command.extend(
+                [
+                    "--gripper-event",
+                    f"{event.time_s:.9f}:{event.position:.9f}:{event.label}",
+                ]
+            )
+        return subprocess.run(
+            backend_command,
+            cwd=backend.parent.parent,
+            check=False,
+        ).returncode
     return 0
 
 

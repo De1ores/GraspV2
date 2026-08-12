@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "Stored upright Gemini optical frame to the graspV2 planning world at stable_stand; capture rotates the physically upside-down sensor by 180 degrees",
+  "description": "Canonical upright Gemini optical transform to the graspV2 planning world at stable_stand; table-aware auto tests raw 0 degrees as the upright-mount hypothesis and stored 180 degrees only as the inverted-mount fallback",
   "coordinate_system": {
     "name": "graspv2_planning_world",
     "axes": "+X robot forward, +Y robot left, +Z up",
@@ -13,6 +13,7 @@
     "pelvis_world_xyz_m": [0.0, 0.0, 0.666452127019],
     "waist_joint_rad": [0.0, 0.0, 0.0],
     "head_yaw_pitch_rad": [0.0, 0.0],
+    "camera_mount_orientation": "inverted",
     "capture_image_rotation_deg": 180,
     "rgbd_geom_pos_in_head_pitch_m": [0.0576096, -0.0111832, -0.0483697],
     "rgbd_geom_quat_wxyz": [0.298835, 0.640857, 0.640857, 0.298835],
@@ -52,7 +53,11 @@
   "candidate_filter": {
     "minimum_height_above_table_m": 0.01,
     "table_polygon_margin_px": 0.0,
-    "table_footprint_margin_m": 0.0
+    "table_footprint_margin_m": 0.0,
+    "table_footprint_tolerance_m": 0.015
+  },
+  "grasp_geometry": {
+    "side_grasp_height_offset_m": 0.01
   },
   "warning": "Nominal stable_stand transform. Tune point_offset_mujoco_m after the camera is rigidly mounted; recompute the matrix when pelvis, waist, or head pose differs."
 }

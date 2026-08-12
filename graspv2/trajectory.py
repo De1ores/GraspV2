@@ -140,6 +140,42 @@ def reverse_trajectory(
     )
 
 
+def slice_trajectory(
+    trajectory: JointTrajectory,
+    start_time_s: float,
+    end_time_s: float,
+    *,
+    source: Path | None = None,
+) -> JointTrajectory:
+    """Extract a time range and rebase it to zero without losing endpoints."""
+
+    start = _finite_float(start_time_s, "slice start_time_s")
+    end = _finite_float(end_time_s, "slice end_time_s")
+    if start < 0.0 or end > trajectory.duration or end <= start:
+        raise TrajectoryValidationError(
+            "trajectory slice must satisfy 0 <= start < end <= duration"
+        )
+    original_times = tuple(
+        value for value in trajectory.times if start < value < end
+    )
+    source_times = (start, *original_times, end)
+    rebased_times = tuple(round(value - start, 9) for value in source_times)
+    rebased_times = (0.0, *rebased_times[1:-1], round(end - start, 9))
+    positions = tuple(
+        tuple(trajectory.sample(value)[name] for name in trajectory.joint_names)
+        for value in source_times
+    )
+    return JointTrajectory(
+        source=source or trajectory.source,
+        joint_names=trajectory.joint_names,
+        times=rebased_times,
+        positions=positions,
+        # Retaining the parent maximum is conservative and avoids understating
+        # velocity when a boundary falls between stored samples.
+        maximum_velocity=trajectory.maximum_velocity,
+    )
+
+
 def load_trajectory(
     path: Path,
     maximum_allowed_velocity: float = 1.5,

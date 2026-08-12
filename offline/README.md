@@ -1,9 +1,14 @@
 # GraspV2 X2 Ultra 离线包
 
+完整的制包、校验、安装、逐层调试、真机执行和故障回滚教程见
+[`docs/package_install_run_debug_zh.md`](../docs/package_install_run_debug_zh.md)。
+
 该目录中的 wheelhouse 和 Jetson 运行库由制包机生成。目标机器人安装时设置
 `PIP_NO_INDEX=1`，所有 Python 包均从归档内安装，不访问互联网。
 YOLOE 所需的 `yoloe-26s-seg.pt` 和 `mobileclip2_b.ts` 也随归档提供；任一
 模型缺失时视觉入口直接报错，不会在机器人上尝试下载。
+
+`./offline_run.sh --help` 不执行安装，也不要求当前主机是 ARM64；可在制包机上先查看参数。
 
 上传并解压后，一条命令即可完成首次安装和规划：
 

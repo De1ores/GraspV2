@@ -152,6 +152,15 @@ class JointSetpoint:
 
 
 @dataclass(frozen=True)
+class JointHealth:
+    """Normalized health for both published X2 ``JointState`` layouts."""
+
+    hottest_temperature_c: int | None
+    error_codes: tuple[tuple[str, int], ...]
+    packed_legacy_temperatures: bool = False
+
+
+@dataclass(frozen=True)
 class UpperBodyFrame:
     """One MC split-mode command in the official fixed-width layout."""
 
@@ -178,6 +187,65 @@ class OmniPickerControl(Protocol):
 
     def command_omnipicker(self, side: str, position: float) -> None:
         ...
+
+
+def inspect_joint_health(joints: Sequence[object]) -> JointHealth:
+    """Resolve native temperatures/errors and the X2 mixed-overlay layout.
+
+    Some deployed X2 publishers still serialize the legacy ``coil_temp`` and
+    ``motor_temp`` bytes while AimDK v1.0 exposes one ``uint16 error_code`` at
+    the same offset.  DDS then presents ``(coil_temp << 8) | motor_temp`` as a
+    non-zero error.  Detect that only at array level: at least four joints must
+    carry plausible paired temperatures.  A lone non-zero value therefore
+    remains a real fault and is never ignored.
+    """
+
+    if all(
+        hasattr(joint, "coil_temp") and hasattr(joint, "motor_temp")
+        for joint in joints
+    ):
+        temperatures = tuple(
+            temperature
+            for joint in joints
+            for temperature in (
+                int(getattr(joint, "coil_temp")),
+                int(getattr(joint, "motor_temp")),
+            )
+        )
+        return JointHealth(
+            hottest_temperature_c=max(temperatures, default=None),
+            error_codes=(),
+        )
+
+    named_codes = tuple(
+        (
+            str(getattr(joint, "name", "")) or "<unnamed>",
+            int(getattr(joint, "error_code", 0)),
+        )
+        for joint in joints
+    )
+    nonzero = tuple(item for item in named_codes if item[1] != 0)
+    decoded = tuple(
+        (code >> 8, code & 0xFF)
+        for _name, code in nonzero
+    )
+    if len(decoded) >= 4 and all(
+        5 <= coil <= 125 and 5 <= motor <= 125
+        for coil, motor in decoded
+    ):
+        return JointHealth(
+            hottest_temperature_c=max(
+                temperature
+                for pair in decoded
+                for temperature in pair
+            ),
+            error_codes=(),
+            packed_legacy_temperatures=True,
+        )
+    return JointHealth(
+        hottest_temperature_c=None,
+        error_codes=nonzero,
+    )
 
 
 def _finite(value: object, label: str) -> float:

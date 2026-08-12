@@ -3,6 +3,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -22,11 +23,13 @@ struct Args {
     int      height     = 720;
     int      fps        = 30;
     int      warmup     = 20;
+    double   timeout_s  = 20.0;
 };
 
 void printUsage(const char *program) {
     std::cout << "Usage: " << program
-              << " [--output DIR] [--width N] [--height N] [--fps N] [--warmup N]\n";
+              << " [--output DIR] [--width N] [--height N] [--fps N]"
+              << " [--warmup N] [--timeout SEC]\n";
 }
 
 Args parseArgs(int argc, char **argv) {
@@ -56,12 +59,17 @@ Args parseArgs(int argc, char **argv) {
         else if(key == "--warmup") {
             args.warmup = std::stoi(value);
         }
+        else if(key == "--timeout") {
+            args.timeout_s = std::stod(value);
+        }
         else {
             throw std::invalid_argument("Unknown argument: " + key);
         }
     }
-    if(args.width <= 0 || args.height <= 0 || args.fps <= 0 || args.warmup < 0) {
-        throw std::invalid_argument("width, height and fps must be positive; warmup must be non-negative");
+    if(args.width <= 0 || args.height <= 0 || args.fps <= 0 || args.warmup < 0 || args.timeout_s <= 0.0) {
+        throw std::invalid_argument(
+            "width, height, fps and timeout must be positive; warmup must be non-negative"
+        );
     }
     return args;
 }
@@ -162,22 +170,26 @@ int main(int argc, char **argv) try {
 
     auto align = std::make_shared<ob::Align>(OB_STREAM_COLOR);
     std::shared_ptr<ob::FrameSet> aligned;
-    for(int frame_index = 0; frame_index <= args.warmup; ++frame_index) {
+    int matched_frames = 0;
+    const auto deadline = std::chrono::steady_clock::now()
+                        + std::chrono::duration<double>(args.timeout_s);
+    while(matched_frames <= args.warmup && std::chrono::steady_clock::now() < deadline) {
         auto frameset = pipeline->waitForFrameset(1500);
         if(!frameset) {
-            --frame_index;
             continue;
         }
         auto aligned_frame = align->process(frameset);
         if(!aligned_frame) {
-            --frame_index;
             continue;
         }
         aligned = aligned_frame->as<ob::FrameSet>();
+        ++matched_frames;
     }
 
-    if(!aligned) {
-        throw std::runtime_error("No aligned frameset received");
+    if(!aligned || matched_frames <= args.warmup) {
+        throw std::runtime_error(
+            "Timed out waiting for aligned Orbbec RGB-D frames"
+        );
     }
     auto color_frame = aligned->getFrame(OB_FRAME_COLOR);
     auto depth_frame = aligned->getFrame(OB_FRAME_DEPTH);

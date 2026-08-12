@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import os
 from pathlib import Path, PurePosixPath
 import sys
+import threading
 import time
 from typing import Callable, Sequence
 
@@ -34,8 +37,10 @@ from aimdk_msgs.srv import GetMcAction, SetMcPresetMotion
 from .mc_animation import (
     DEFAULT_ANIMATION_NAME,
     DEFAULT_ARM_POSITION,
+    McGripperEvent,
     validate_mc_animation_csv,
 )
+from .hardware_contract import inspect_joint_health
 from .ros_logging import configure_fastdds_logging
 from .trajectory import ARM_JOINT_ORDER
 
@@ -44,6 +49,9 @@ ARM_STATE_TOPIC = "/aima/hal/joint/arm/state"
 GET_ACTION_SERVICE = "/aimdk_5Fmsgs/srv/GetMcAction"
 PRESET_MOTION_SERVICE = "/aimdk_5Fmsgs/srv/SetMcPresetMotion"
 DEFAULT_ROBOT_PATH = "/tmp/graspv2_mc_grasp_animation.csv"
+DEFAULT_OMNIPICKER_STUDENT_SDK = (
+    Path(__file__).resolve().parents[1] / "omnipicker_hand_student.py"
+)
 
 _CORE_ARM_JOINTS = tuple(
     name
@@ -54,6 +62,32 @@ _CORE_ARM_JOINTS = tuple(
 
 class SafetyError(RuntimeError):
     """Raised when live state is unsuitable for an MC-owned animation."""
+
+
+def _load_omnipicker_student_sdk(path: Path):
+    """Load the repository SDK without allowing its fallback re-exec."""
+
+    source = path.expanduser().resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"repository OmniPicker SDK is missing: {source}")
+    spec = importlib.util.spec_from_file_location(
+        "_graspv2_omnipicker_hand_student",
+        source,
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load repository OmniPicker SDK: {source}")
+    module = importlib.util.module_from_spec(spec)
+    flag = "_OMNIPICKER_STUDENT_REEXEC"
+    previous_flag = os.environ.get(flag)
+    os.environ[flag] = "1"
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if previous_flag is None:
+            os.environ.pop(flag, None)
+        else:
+            os.environ[flag] = previous_flag
+    return module
 
 
 def _require_compatible_sdk_layout() -> None:
@@ -111,6 +145,168 @@ class McCustomGraspClient(Node):
             SetMcPresetMotion,
             PRESET_MOTION_SERVICE,
         )
+        self.omnipicker_sdk: object | None = None
+        self.omnipicker_node: object | None = None
+        self._gripper_close_attempted = False
+        self._gripper_close_thread: threading.Thread | None = None
+        self._gripper_close_succeeded = False
+        self._gripper_event_index = 0
+        self._gripper_event_failures: list[str] = []
+        self._configure_gripper_best_effort()
+
+    def _warn_gripper(self, message: str) -> None:
+        self.get_logger().warning(
+            f"OmniPicker best-effort warning: {message}; MC animation continues"
+        )
+
+    def _configure_gripper_best_effort(self) -> None:
+        """Instantiate the repository student SDK without failing arm motion."""
+
+        if self.args.no_gripper:
+            return
+        try:
+            self.omnipicker_sdk = _load_omnipicker_student_sdk(
+                self.args.omnipicker_sdk
+            )
+            self.omnipicker_node = self.omnipicker_sdk.OmniPickerStudentNode()
+        except (Exception, SystemExit) as error:
+            self.omnipicker_sdk = None
+            self.omnipicker_node = None
+            if getattr(self.args, "require_gripper_sdk", False):
+                raise RuntimeError(
+                    "competition OmniPicker SDK could not be loaded: "
+                    f"{error}"
+                ) from error
+            self._warn_gripper(f"could not load repository student SDK: {error}")
+
+    def _run_gripper_sdk_best_effort(
+        self,
+        action: str | float,
+        *,
+        label: str | None = None,
+    ) -> bool:
+        """Call the repository SDK's publish_command; never raise to MC."""
+
+        if self.omnipicker_node is None:
+            return False
+        if isinstance(action, str):
+            if action not in {"open", "close"}:
+                raise ValueError(f"unsupported OmniPicker action: {action}")
+            target_position = 1.0 if action == "open" else 0.0
+            description = action
+        else:
+            target_position = float(action)
+            if not 0.0 <= target_position <= 1.0:
+                raise ValueError("OmniPicker position must be within [0, 1]")
+            description = label or f"position={target_position:.3f}"
+        try:
+            self.omnipicker_node.publish_command("right", target_position)
+            self.get_logger().info(
+                "Repository omnipicker_hand_student SDK completed "
+                f"{description} right"
+            )
+            return True
+        except (Exception, SystemExit) as error:
+            self._warn_gripper(
+                f"student SDK {description} right failed: {error}"
+            )
+            return False
+
+    def _run_close_worker(self) -> None:
+        self._gripper_close_succeeded = self._run_gripper_sdk_best_effort(
+            "close"
+        )
+        if not self._gripper_close_succeeded:
+            self._gripper_event_failures.append("close")
+
+    def _run_gripper_event_worker(self, event: McGripperEvent) -> None:
+        succeeded = self._run_gripper_sdk_best_effort(
+            event.position,
+            label=event.label,
+        )
+        self._gripper_close_succeeded = (
+            self._gripper_close_succeeded or succeeded
+        )
+        if not succeeded:
+            self._gripper_event_failures.append(event.label)
+
+    def _advance_gripper_events_best_effort(
+        self,
+        *,
+        animation_elapsed_s: float,
+    ) -> None:
+        """Dispatch each due hand event without blocking arm observation."""
+
+        events = tuple(getattr(self.args, "gripper_events", ()))
+        if self._gripper_event_index >= len(events):
+            return
+        worker = self._gripper_close_thread
+        if worker is not None and worker.is_alive():
+            return
+        event = events[self._gripper_event_index]
+        if animation_elapsed_s + 1e-6 < event.time_s:
+            return
+        self._gripper_event_index += 1
+        self._gripper_close_attempted = True
+        if self.omnipicker_node is None:
+            return
+        delay = max(0.0, animation_elapsed_s - event.time_s)
+        self.get_logger().info(
+            f"Animation event {self._gripper_event_index}/{len(events)}: "
+            f"{event.label}, right target={event.position:.3f}, "
+            f"schedule_delay={delay:.3f} s"
+        )
+        self._gripper_close_thread = threading.Thread(
+            target=self._run_gripper_event_worker,
+            args=(event,),
+            name=f"graspv2_omnipicker_event_{self._gripper_event_index}",
+            daemon=True,
+        )
+        self._gripper_close_thread.start()
+
+    def _advance_gripper_close_best_effort(
+        self,
+        *,
+        animation_elapsed_s: float,
+        now: float,
+    ) -> None:
+        """Start the repository SDK close call without blocking arm feedback."""
+
+        del now
+        if (
+            self._gripper_close_attempted
+            or animation_elapsed_s < self.args.gripper_close_time_s
+        ):
+            return
+        self._gripper_close_attempted = True
+        if self.omnipicker_node is None:
+            return
+        self.get_logger().info(
+            "Animation reached the target hold; calling repository "
+            "omnipicker_hand_student SDK: close right"
+        )
+        self._gripper_close_thread = threading.Thread(
+            target=self._run_close_worker,
+            name="graspv2_omnipicker_student_close",
+            daemon=True,
+        )
+        self._gripper_close_thread.start()
+
+    def shutdown_gripper_best_effort(self) -> None:
+        """Reap the SDK worker and node without changing the command result."""
+
+        thread = self._gripper_close_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=3.0)
+        if thread is not None and thread.is_alive():
+            self._warn_gripper("student SDK close worker did not finish in time")
+            return
+        if self.omnipicker_node is not None:
+            try:
+                self.omnipicker_node.destroy_node()
+            except Exception as error:
+                self._warn_gripper(f"student SDK node cleanup failed: {error}")
+            self.omnipicker_node = None
 
     def _arm_callback(self, message: JointStateArray) -> None:
         self.arm_state = message
@@ -160,31 +356,20 @@ class McCustomGraspClient(Node):
                 "arm state is missing core joints: " + ", ".join(missing)
             )
 
-        hottest: int | None = None
-        if all(
-            hasattr(joint, "coil_temp") and hasattr(joint, "motor_temp")
-            for joint in joints
-        ):
-            hottest = max(
-                max(int(joint.coil_temp), int(joint.motor_temp))
-                for joint in joints
+        health = inspect_joint_health(joints)
+        if health.error_codes:
+            raise SafetyError(
+                "arm joints report non-zero error_code: "
+                + ", ".join(
+                    f"{name}={code}" for name, code in health.error_codes
+                )
             )
-            if hottest >= self.args.max_temperature:
-                raise SafetyError(
-                    f"arm temperature {hottest} C reached the configured "
-                    f"{self.args.max_temperature} C threshold"
-                )
-        else:
-            failed_joints = [
-                joint.name
-                for joint in joints
-                if int(getattr(joint, "error_code", 0)) != 0
-            ]
-            if failed_joints:
-                raise SafetyError(
-                    "arm joints report non-zero error_code: "
-                    + ", ".join(failed_joints)
-                )
+        hottest = health.hottest_temperature_c
+        if hottest is not None and hottest >= self.args.max_temperature:
+            raise SafetyError(
+                f"arm temperature {hottest} C reached the configured "
+                f"{self.args.max_temperature} C threshold"
+            )
         fastest = max(abs(float(joint.velocity)) for joint in joints)
         if fastest > self.args.max_start_velocity:
             raise SafetyError(
@@ -204,14 +389,19 @@ class McCustomGraspClient(Node):
                 f"{position_error:.3f} rad, limit is "
                 f"{self.args.max_start_error:.3f} rad"
             )
-        health = (
+        health_summary = (
             f"hottest={hottest} C"
+            + (
+                " (decoded from legacy packed temperature bytes)"
+                if health.packed_legacy_temperatures
+                else ""
+            )
             if hottest is not None
             else "per-joint error_code=0"
         )
         self.get_logger().info(
             "Compatible AimDK arm state: "
-            f"{len(joints)} joints, {health}, "
+            f"{len(joints)} joints, {health_summary}, "
             f"max_velocity={fastest:.3f} rad/s, "
             f"start_error={position_error:.3f} rad"
         )
@@ -360,9 +550,13 @@ class McCustomGraspClient(Node):
             + self.args.completion_margin
         )
         started = False
+        self._gripper_close_attempted = False
+        self._gripper_close_succeeded = False
+        self._gripper_event_index = 0
+        self._gripper_event_failures = []
         while time.monotonic() < completion_deadline:
             self.arm_state = None
-            rclpy.spin_once(self, timeout_sec=0.05)
+            rclpy.spin_once(self, timeout_sec=0.01)
             if self.arm_state is None:
                 continue
             positions = self._arm_positions()
@@ -388,6 +582,17 @@ class McCustomGraspClient(Node):
                 )
 
             elapsed = time.monotonic() - accepted_at
+            if started:
+                events = tuple(getattr(self.args, "gripper_events", ()))
+                if events:
+                    self._advance_gripper_events_best_effort(
+                        animation_elapsed_s=elapsed,
+                    )
+                else:
+                    self._advance_gripper_close_best_effort(
+                        animation_elapsed_s=elapsed,
+                        now=time.monotonic(),
+                    )
             if started and elapsed >= self.args.animation_duration:
                 default_by_name = dict(
                     zip(ARM_JOINT_ORDER, DEFAULT_ARM_POSITION)
@@ -405,6 +610,44 @@ class McCustomGraspClient(Node):
                         f"max_error={return_error:.3f} rad, "
                         f"max_velocity={fastest:.3f} rad/s"
                     )
+                    events = tuple(getattr(self.args, "gripper_events", ()))
+                    if events and self._gripper_event_index != len(events):
+                        raise RuntimeError(
+                            "MC returned safely, but only "
+                            f"{self._gripper_event_index}/{len(events)} staged "
+                            "OmniPicker events were dispatched"
+                        )
+                    worker = self._gripper_close_thread
+                    if worker is not None and worker.is_alive():
+                        worker.join(timeout=3.0)
+                    if (
+                        worker is not None
+                        and worker.is_alive()
+                        and getattr(self.args, "require_gripper_sdk", False)
+                    ):
+                        raise RuntimeError(
+                            "MC returned safely, but the competition OmniPicker "
+                            "SDK worker did not finish"
+                        )
+                    if (
+                        self._gripper_event_failures
+                        and getattr(self.args, "require_gripper_sdk", False)
+                    ):
+                        raise RuntimeError(
+                            "MC returned safely, but competition OmniPicker SDK "
+                            "commands failed: "
+                            + ", ".join(self._gripper_event_failures)
+                        )
+                    if events:
+                        self.get_logger().info(
+                            f"All {len(events)} staged OmniPicker events were "
+                            "dispatched during MC playback"
+                        )
+                    elif self._gripper_close_succeeded:
+                        self.get_logger().info(
+                            "Repository OmniPicker SDK close completed without "
+                            "blocking arm feedback"
+                        )
                     return
 
             if not started and time.monotonic() >= start_deadline:
@@ -435,6 +678,37 @@ class McCustomGraspClient(Node):
 
     def execute(self) -> None:
         self.preflight()
+        # Establish the planned initial hand state through the exact repository
+        # student SDK before MC starts the atomic arm animation.
+        # Competition mode requires this initial publication to succeed. During
+        # playback MC still owns the safe return; any later SDK failure is
+        # reported only after the arm has returned.
+        initial_position = getattr(
+            getattr(self, "args", None),
+            "initial_gripper_position",
+            None,
+        )
+        if initial_position is None:
+            # Backward compatibility for callers constructed before staged
+            # grasp animations existed.
+            initial_succeeded = self._run_gripper_sdk_best_effort("open")
+        else:
+            initial_succeeded = self._run_gripper_sdk_best_effort(
+                initial_position,
+                label="initial-hand-state",
+            )
+        if (
+            not initial_succeeded
+            and getattr(
+                getattr(self, "args", None),
+                "require_gripper_sdk",
+                False,
+            )
+        ):
+            raise RuntimeError(
+                "competition OmniPicker SDK initial command failed before "
+                "animation playback"
+            )
         # Re-check immediately before the only request that can start motion.
         self.require_sd_mode()
         self.arm_state = None
@@ -446,6 +720,35 @@ class McCustomGraspClient(Node):
 
 def _project_root() -> Path:
     return Path(__file__).resolve().parents[1]
+
+
+def _gripper_event(value: str) -> McGripperEvent:
+    """Parse TIME:POSITION:LABEL for the internal animation backend."""
+
+    parts = value.split(":", 2)
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError(
+            "gripper event must use TIME:POSITION:LABEL"
+        )
+    try:
+        time_s = float(parts[0])
+        position = float(parts[1])
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "gripper event time and position must be numbers"
+        ) from error
+    label = parts[2].strip()
+    if not time_s >= 0.0 or not time_s < float("inf"):
+        raise argparse.ArgumentTypeError(
+            "gripper event time must be finite and non-negative"
+        )
+    if not 0.0 <= position <= 1.0:
+        raise argparse.ArgumentTypeError(
+            "gripper event position must be within [0, 1]"
+        )
+    if not label:
+        raise argparse.ArgumentTypeError("gripper event label must be non-empty")
+    return McGripperEvent(time_s=time_s, position=position, label=label)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -466,6 +769,40 @@ def _parser() -> argparse.ArgumentParser:
         "--robot-animation-path",
         default=DEFAULT_ROBOT_PATH,
         help="absolute CSV path visible to the robot's MC process",
+    )
+    parser.add_argument(
+        "--omnipicker-sdk",
+        type=Path,
+        default=DEFAULT_OMNIPICKER_STUDENT_SDK,
+        help="repository omnipicker_hand_student.py SDK path",
+    )
+    parser.add_argument(
+        "--no-gripper",
+        action="store_true",
+        help="play only the arm animation without best-effort OmniPicker commands",
+    )
+    parser.add_argument(
+        "--require-gripper-sdk",
+        action="store_true",
+        help=(
+            "require repository omnipicker_hand_student.py loading and command "
+            "success (competition profile)"
+        ),
+    )
+    parser.add_argument(
+        "--initial-gripper-position",
+        type=float,
+        default=1.0,
+        help="right OmniPicker target established before animation playback",
+    )
+    parser.add_argument(
+        "--gripper-event",
+        dest="gripper_events",
+        action="append",
+        type=_gripper_event,
+        default=[],
+        metavar="TIME:POSITION:LABEL",
+        help="repeatable hand target synchronized to the animation clock",
     )
     parser.add_argument(
         "--motion-id",
@@ -532,6 +869,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, ValueError) as error:
         parser.error(str(error))
     args.animation_duration = info.duration_s
+    args.gripper_close_time_s = info.grasp_close_time_s
+
+    args.omnipicker_sdk = args.omnipicker_sdk.expanduser().resolve()
 
     robot_path = PurePosixPath(args.robot_animation_path)
     if not robot_path.is_absolute() or robot_path.suffix.lower() != ".csv":
@@ -560,6 +900,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--motion-id must be non-zero")
     if args.area < 0:
         parser.error("--area must be non-negative")
+    if not 0.0 <= args.initial_gripper_position <= 1.0:
+        parser.error("--initial-gripper-position must be within [0, 1]")
+    if args.no_gripper and args.require_gripper_sdk:
+        parser.error("--no-gripper conflicts with --require-gripper-sdk")
+    if any(
+        later.time_s <= earlier.time_s
+        for earlier, later in zip(args.gripper_events, args.gripper_events[1:])
+    ):
+        parser.error("--gripper-event times must be strictly increasing")
+    if any(event.time_s > info.duration_s for event in args.gripper_events):
+        parser.error("--gripper-event time exceeds animation duration")
 
     print(f"Local MC animation: {local_animation}")
     print(f"Robot MC animation: {robot_path}")
@@ -572,7 +923,38 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"{info.duration_s:.3f} s, max "
         f"{info.maximum_arm_velocity:.3f} rad/s"
     )
-    print("Hand control: DISABLED; the 20-column CSV has no hand fields.")
+    if args.no_gripper:
+        print("OmniPicker: DISABLED explicitly; arm animation only.")
+    else:
+        if args.gripper_events:
+            print(
+                "OmniPicker staged sequence: initial="
+                f"{args.initial_gripper_position:.3f}; "
+                + ", ".join(
+                    f"{event.label}@{event.time_s:.3f}s="
+                    f"{event.position:.3f}"
+                    for event in args.gripper_events
+                )
+            )
+        else:
+            print(
+                "OmniPicker: repository omnipicker_hand_student SDK opens "
+                "before playback, then closes at "
+                f"target hold t={info.grasp_close_time_s:.3f}s "
+                f"(detected hold={info.grasp_hold_duration_s:.3f}s)."
+            )
+        print(f"OmniPicker SDK: {args.omnipicker_sdk}")
+        if args.require_gripper_sdk:
+            print(
+                "OmniPicker policy: competition SDK is required; initial "
+                "failure blocks motion and event failures are reported after "
+                "MC completes its safe return."
+            )
+        else:
+            print(
+                "OmniPicker failure policy: warning only; SDK/DDS/controller/"
+                "cable failures never abort arm playback or reverse-return."
+            )
     print(
         "Return path: ENABLED inside the CSV; MC will play forward, hold, "
         "reverse the JSON, then return to its default arm pose."
@@ -611,6 +993,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     finally:
         if node is not None:
+            node.shutdown_gripper_best_effort()
             node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

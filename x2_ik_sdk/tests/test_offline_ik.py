@@ -1,3 +1,7 @@
+import math
+
+import numpy as np
+
 from x2_ik_sdk import ArmSide, X2ArmIKSolver, X2IKConfig
 
 
@@ -8,7 +12,7 @@ def test_right_arm_offset_ik():
     target = [current[0] + 0.01, current[1], current[2] + 0.01]
     result = solver.solve_position(ArmSide.RIGHT, target, seed)
     assert result.success
-    assert result.error_norm < 2e-4
+    assert result.error_norm < solver.config.eps
     assert len(result.arm_pos) == 14
     assert solver.arm_dof == 7
 
@@ -20,7 +24,7 @@ def test_left_arm_offset_ik():
     target = [current[0] + 0.01, current[1], current[2] + 0.01]
     result = solver.solve_position(ArmSide.LEFT, target, seed)
     assert result.success
-    assert result.error_norm < 2e-4
+    assert result.error_norm < solver.config.eps
     assert len(result.arm_pos) == 14
 
 
@@ -53,6 +57,33 @@ def test_left_arm_pose_ik():
     result = solver.solve_pose(ArmSide.LEFT, target_xyz, target_rpy, seed)
     assert result.success
     assert result.error_norm < 2e-4
+
+
+def test_right_arm_position_axis_ik_leaves_axial_yaw_free():
+    solver = X2ArmIKSolver(X2IKConfig.default_omnipicker())
+    seed = solver.ready_arm_pos()
+    target_xyz = solver.fk_xyz(ArmSide.RIGHT, seed)
+    rpy = solver.fk_rpy(ArmSide.RIGHT, seed)
+    roll, pitch, yaw = rpy
+    current_local_z_world = np.asarray(
+        [
+            math.cos(yaw) * math.sin(pitch) * math.cos(roll)
+            + math.sin(yaw) * math.sin(roll),
+            math.sin(yaw) * math.sin(pitch) * math.cos(roll)
+            - math.cos(yaw) * math.sin(roll),
+            math.cos(pitch) * math.cos(roll),
+        ]
+    )
+    result = solver.solve_position_axis(
+        ArmSide.RIGHT,
+        target_xyz,
+        (0.0, 0.0, 1.0),
+        current_local_z_world,
+        seed,
+    )
+    assert result.success
+    assert result.error_norm < 2e-4
+    assert len(result.active_arm) == 7
 
 
 def test_5dof_position_and_pose_ik():

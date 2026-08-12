@@ -6,6 +6,9 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 fi
 
 graspv2_env_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+graspv2_runtime_profile="$(
+  "${graspv2_env_root}/tools/detect_runtime_profile.sh"
+)"
 
 if ! graspv2_aimdk_setup="$(
   "${graspv2_env_root}/tools/select_aimdk_setup.sh"
@@ -28,6 +31,7 @@ source "${graspv2_aimdk_setup}"
 source "${graspv2_env_root}/install/local_setup.bash"
 
 export GRASPV2_AIMDK_SETUP="${graspv2_aimdk_setup}"
+export GRASPV2_RUNTIME_PROFILE="${graspv2_runtime_profile}"
 export GRASPV2_X2_ENV_READY=1
 
 if [[ "${graspv2_env_restore_nounset}" == true ]]; then
@@ -48,4 +52,5 @@ else
 fi
 
 echo "X2 MC environment ready with ${graspv2_transport}"
+echo "Runtime profile: ${graspv2_runtime_profile}"
 echo "AimDK overlay: ${graspv2_aimdk_setup}"

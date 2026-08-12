@@ -1,63 +1,93 @@
-# svt Orin 运行命令
+# svt Orin 最短部署命令
 
-## 完整离线包（推荐）
+目标：`svt@192.168.1.240`，项目目录：`/home/svt/graspV2`。
+比赛真机的实测 OS/Agi/AimDK 环境、统一 source 顺序和 Motion 接口见
+[`docs/competition_robot_environment_motion_zh.md`](docs/competition_robot_environment_motion_zh.md)。
 
-在联网的制包机上执行一次：
+## 1. 开发机打包并上传
 
 ```bash
+cd /home/GraspV2
 ./tools/fetch_offline_dependencies.sh
 ./tools/build_offline_bundle.sh
+scp dist/graspv2-x2-ultra-offline.tar.gz{,.sha256} \
+  svt@192.168.1.240:/home/svt/
 ```
 
-将 `dist/graspv2-x2-ultra-offline.tar.gz` 和同名 `.sha256` 文件上传到
-X2 Ultra。真机无需联网：
+## 2. 机器人首次安装
 
 ```bash
-sha256sum -c graspv2-x2-ultra-offline.tar.gz.sha256
+ssh svt@192.168.1.240
+cd /home/svt
+sha256sum --check graspv2-x2-ultra-offline.tar.gz.sha256
 tar -xzf graspv2-x2-ultra-offline.tar.gz
-cd graspv2-x2-ultra-offline
-./offline_run.sh --target-class cup --plan-only
+mv graspv2-x2-ultra-offline graspV2
+cd graspV2
+./install_offline.sh
 ```
 
-`offline_run.sh` 首次运行会自动创建规划/视觉环境、解包 Jetson CUDA 运行库，
-并针对真机已有的 AimDK 编译 ROS 包。所有 pip 操作均使用 `--no-index`；不会
-下载、更新或覆盖系统 ROS、AimDK 与 CUDA 驱动。
+成功时会看到 `headless_model_check=PASS`、`gpu=Orin` 和
+`Offline GraspV2 installation complete`。安装器检测到 Orbbec SDK 时会同时生成
+`build/orbbec_capture`；运行默认先等 X2 topic，超时后自动回退 SDK。图像先保持 `0°`，只有
+桌面识别失败才同步旋转 RGB-D 到 `180°` 重试。
 
-项目目录：`/home/svt/graspV2`。
-
-部署使用两个隔离环境：`.venv` 负责 Jetson CUDA/YOLOE，`.planning-venv`
-负责官方 IK 和 MuJoCo；一键脚本会自动选择，不要手工混装两套 NumPy 依赖。
-
-命令只需指定识别物体类型；仿真与真机固定使用 Ultra 右臂：
+## 3. 识别和规划，不移动机器人
 
 ```bash
 cd /home/svt/graspV2
-./run_full_grasp_pipeline.sh --target-class "orange-capped pill bottle" \
+export GRASPV2_RUNTIME_PROFILE=test
+./offline_run.sh \
+  --target-class cup \
+  --camera-calibration config/mujoco_camera_calibration.json \
   --plan-only
 ```
 
-- `--target-class` 是 YOLOE 开放词汇物体类别；带空格时使用引号，例如
-  `--target-class "game controller"`。
-- Ultra 每臂 7 轴，手臂反馈固定校验为 14 轴。
-- 比赛机只有右手安装夹爪，因此抓取规划和真机执行固定使用右臂，不会回退到左臂。
-- 不加 `--execute` 时不会连接机器人控制接口。
+## 4. 真机执行
 
-识别、规划并离线生成动作 CSV：
+确认机器人稳定站立、相机外参、TCP、吊架和急停后执行：
 
 ```bash
-./run_full_grasp_pipeline.sh --target-class cup
-```
-
-确认相机外参、机器人稳定站立、吊架和急停均已就绪后，才可执行实机动作：
-
-真机执行会强制现场重新采集 RGB-D；`--use-existing-vision` 和
-`--capture-backend existing` 只允许离线检查。
-
-```bash
-./run_full_grasp_pipeline.sh \
+cd /home/svt/graspV2
+export GRASPV2_RUNTIME_PROFILE=test
+./offline_run.sh \
   --target-class cup \
-  --execute \
-  --confirm-calibrated
+  --camera-calibration config/mujoco_camera_calibration.json \
+  --execute --confirm-calibrated  --yes
 ```
 
-实机命令仍会要求输入 `RUN`；不要在首次测试时使用 `--yes`。
+orange-capped pill
+./offline_run.sh --target-class " bottle" \
+  --camera-calibration config/mujoco_camera_calibration.json \
+  --execute --confirm-calibrated --yes
+
+./offline_run.sh --target-class "bag of corn bread" \
+  --camera-calibration config/mujoco_camera_calibration.json \
+  --execute --confirm-calibrated --yes
+终端提示后输入 `RUN`。首次测试不要添加 `--yes`。带空格的类别必须加引号，例如
+`--target-class "orange-capped pill bottle"`。
+
+本页是 SVT 测试机部署，因此固定 `GRASPV2_RUNTIME_PROFILE=test`。animation 上传默认先连接
+`agi@10.0.200.40`，连接或认证失败后自动尝试
+`agi@10.0.1.40`。两个地址默认使用密码 `1`，由 OpenSSH askpass 自动提供，不需要安装
+`sshpass`，也不会在终端交互询问。现场参数可通过环境变量覆盖：
+
+```bash
+export GRASPV2_ROBOT_ADDRESS=10.0.200.40
+export GRASPV2_ROBOT_FALLBACK_ADDRESS=10.0.1.40
+export GRASPV2_ROBOT_USER=agi
+export GRASPV2_ROBOT_PASSWORD=1
+```
+
+这些地址和密码只属于测试模式。比赛机 `agi/aarch64` 使用本机 MC 和
+`/home/agi/aimdk/install/setup.bash`，不会访问上述测试地址。
+
+执行命令会预先生成 MC animation 安全回退。只要计划轨迹尚未开始，旧 upper-body 接管失败
+就会自动切换；输入源激活 HOLD 帧和初始空夹爪命令不阻止回退。已经开始运动后仍立即停止，
+不会跨控制器重放。回退的
+机械臂和夹爪阶段与仿真一致，包括安全预备、下降、按半径闭合、抬升/悬停、受控放下、
+松开、撤离和回默认位。单条 MC animation 不能等待中间视觉判定，终端会明确提示
+`MC animation fallback`。
+
+单独执行 `./run.sh --mode animation --execute` 时，程序会调用仓库内
+`omnipicker_hand_student.py` SDK，在播放前执行 `open right`、到达目标保持段时并行执行
+`close right`。测试机未接夹爪控制线时只提示 warning，手臂 animation 和返回动作仍继续。

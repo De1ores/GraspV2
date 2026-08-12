@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
 
 
@@ -19,7 +20,23 @@ def _require_exact(message_type: type, expected: set[str]) -> None:
         )
 
 
-def validate() -> None:
+def _require_native_type_support(message_type: type) -> None:
+    """Import one generated extension so host/target architecture must match."""
+
+    try:
+        message_type.__class__.__import_type_support__()
+    except (ImportError, ModuleNotFoundError, RuntimeError) as error:
+        raise RuntimeError(
+            f"{message_type.__name__} native ROS type support failed to load: "
+            f"{error}"
+        ) from error
+    if getattr(message_type.__class__, "_TYPE_SUPPORT", None) is None:
+        raise RuntimeError(
+            f"{message_type.__name__} native ROS type support is unavailable"
+        )
+
+
+def validate(required_capability: str = "base") -> set[str]:
     try:
         from aimdk_msgs.msg import (
             HandCommand,
@@ -32,7 +49,6 @@ def validate() -> None:
             McActionCommand,
             McInputAction,
             McInputSource,
-            UpperBodyCommandArray,
         )
         from aimdk_msgs.srv import (
             GetCurrentInputSource,
@@ -45,6 +61,10 @@ def validate() -> None:
         raise RuntimeError(
             f"required AimDK interface import failed: {error}"
         ) from error
+    try:
+        from aimdk_msgs.msg import UpperBodyCommandArray
+    except (ImportError, ModuleNotFoundError):
+        UpperBodyCommandArray = None
 
     exact_schemas = {
         JointCommand: {
@@ -81,14 +101,6 @@ def validate() -> None:
             "right_hands",
             "right_touch_sensors",
         },
-        UpperBodyCommandArray: {
-            "header",
-            "source",
-            "hand_sub_mode",
-            "head_pos",
-            "arm_pos",
-            "hand_pos",
-        },
         McActionCommand: {"action", "action_desc"},
         McInputAction: {"value"},
         McInputSource: {"name", "priority", "timeout"},
@@ -103,6 +115,26 @@ def validate() -> None:
     }
     for message_type, expected in exact_schemas.items():
         _require_exact(message_type, expected)
+    # Importing Python message definitions alone can incorrectly accept an
+    # x86_64 install_host overlay on an aarch64 competition computer.  Force
+    # the native extension to load during selection, before any ROS node is
+    # constructed.
+    _require_native_type_support(JointStateArray)
+
+    capabilities = {"base", "animation", "hal-joint", "omnipicker"}
+    if UpperBodyCommandArray is not None:
+        _require_exact(
+            UpperBodyCommandArray,
+            {
+                "header",
+                "source",
+                "hand_sub_mode",
+                "head_pos",
+                "arm_pos",
+                "hand_pos",
+            },
+        )
+        capabilities.add("upper-body")
 
     joint_state_fields = _fields(JointState)
     joint_state_base = {"name", "position", "velocity", "effort"}
@@ -138,15 +170,33 @@ def validate() -> None:
         raise RuntimeError(
             f"McInputAction constants are {action_values}, expected {expected_actions}"
         )
+    if required_capability not in capabilities:
+        raise RuntimeError(
+            f"required capability {required_capability!r} is unavailable; "
+            f"overlay provides {', '.join(sorted(capabilities))}"
+        )
+    return capabilities
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Validate an AimDK overlay without contacting ROS"
+    )
+    parser.add_argument(
+        "--require-capability",
+        choices=("base", "animation", "upper-body", "hal-joint", "omnipicker"),
+        default="base",
+    )
+    args = parser.parse_args(argv)
     try:
-        validate()
+        capabilities = validate(args.require_capability)
     except RuntimeError as error:
         print(f"Incompatible AimDK overlay: {error}", file=sys.stderr)
         return 1
-    print("Compatible AimDK control schema")
+    print(
+        "Compatible AimDK schema; capabilities: "
+        + ", ".join(sorted(capabilities))
+    )
     return 0
 
 

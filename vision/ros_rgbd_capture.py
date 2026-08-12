@@ -69,8 +69,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=(0, 180),
         default=180,
         help=(
-            "Rotate both registered RGB and depth before storage. The X2 "
-            "competition camera is mounted upside down, so the default is 180."
+            "Rotate both registered RGB and depth before storage. Direct "
+            "low-level use defaults to 180 for compatibility; run_vision.sh "
+            "passes the selected per-machine calibration profile."
         ),
     )
     return parser.parse_args(argv)
@@ -532,15 +533,12 @@ def write_capture(pair: CapturedPair, args: argparse.Namespace) -> None:
         },
         "image_orientation": {
             "rotation_deg": image_rotation_deg,
-            "reason": (
-                "X2 competition RGB-D camera is physically mounted upside down"
-                if image_rotation_deg == 180
-                else "rotation disabled by capture option"
-            ),
+            "reason": "configured synchronized RGB-D storage rotation",
             "applied_to": ["color.png", "depth.png", "camera intrinsics"],
         },
         "camera_coordinate_convention": (
-            "stored upright color optical frame: +x right, +y down, +z forward"
+            "stored color optical frame after declared image rotation: "
+            "+x right, +y down, +z forward"
         ),
         "ros_topics": {
             "color": args.color_topic,
@@ -621,4 +619,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except TimeoutError as error:
+        # A dedicated status lets the shell entrypoint distinguish a missing
+        # or incomplete topic set from malformed RGB-D data.  Only this status
+        # is safe to route to the local camera SDK automatically.
+        print(f"RGB-D topic timeout: {error}", file=sys.stderr)
+        raise SystemExit(20) from None

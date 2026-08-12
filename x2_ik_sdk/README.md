@@ -6,6 +6,7 @@
 
 - 左臂和右臂末端位置 IK；
 - 左臂和右臂末端姿态 IK（同时约束 `xyz` 与 `rpy`）；
+- 末端位置加单轴方向 IK（约束 `xyz` 和工具轴，轴向旋转保持自由）；
 - 末端位置 `xyz` 和姿态 `rpy` 的正运动学；
 - `arm_pos` 与 Pinocchio configuration 的相互转换；
 - 兼容单臂 7 自由度与 5 自由度（无 `wrist_pitch` / `wrist_roll`）；
@@ -53,6 +54,9 @@ print(result.final_xyz, result.final_rpy)
 ```
 
 仅约束位置时仍可用 `solve_position`。
+
+只需要保持夹爪轴线垂直、但不希望额外锁死绕轴角度时，使用
+`solve_position_axis(side, target_xyz, local_axis, target_axis, current_arm_pos)`。
 
 ### 5 自由度手臂
 

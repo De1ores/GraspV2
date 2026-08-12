@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from bisect import bisect_right
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
@@ -31,19 +31,12 @@ from .simulation import (
 
 
 SIDE_GRASP_APPROACH_HEADING_DEG = 0.0
-SIDE_GRASP_POSITION_ONLY_IK = True
-SAFE_STAGING_OUTWARD_OFFSET_M = 0.06
 MAXIMUM_GRIPPER_AXIS_ERROR_DEG = 1.0
-# A position-only IK that exhausts its iterations may still end at a useful
-# joint-limit boundary.  Such a point is accepted only after the same MuJoCo
-# state/edge gates as an exact solution, and the closest valid seed wins.
-MAXIMUM_NEAREST_IK_POSITION_ERROR_M = 0.05
 GRIPPER_PREOPEN_DURATION_S = 2.0
 GRIPPER_CLOSE_DURATION_S = 2.0
 GRASP_SETTLE_DURATION_S = 0.3
-LIFTED_HOLD_DURATION_S = 2.5
 GRIPPER_RELEASE_DURATION_S = 2.0
-PLACE_SETTLE_DURATION_S = 0.7
+OBJECT_DROP_DURATION_S = 0.7
 GRIPPER_RECLOSE_DURATION_S = 2.0
 
 
@@ -138,9 +131,8 @@ class SimulatedGraspSequence:
     open_duration_s: float = GRIPPER_PREOPEN_DURATION_S
     close_duration_s: float = GRIPPER_CLOSE_DURATION_S
     grasp_settle_duration_s: float = GRASP_SETTLE_DURATION_S
-    lifted_hold_duration_s: float = LIFTED_HOLD_DURATION_S
     release_duration_s: float = GRIPPER_RELEASE_DURATION_S
-    place_settle_duration_s: float = PLACE_SETTLE_DURATION_S
+    object_drop_duration_s: float = OBJECT_DROP_DURATION_S
     reclose_duration_s: float = GRIPPER_RECLOSE_DURATION_S
 
     @property
@@ -151,9 +143,8 @@ class SimulatedGraspSequence:
             + self.close_duration_s
             + self.grasp_settle_duration_s
             + self.lift.duration_s
-            + self.lifted_hold_duration_s
             + self.release_duration_s
-            + self.place_settle_duration_s
+            + self.object_drop_duration_s
             + self.reclose_duration_s
             + self.return_to_default.duration_s
         )
@@ -175,10 +166,7 @@ def gripper_positions_for_visual_radius(
     if not math.isfinite(maximum) or maximum <= 0.0:
         raise ValueError("maximum_diameter_m must be positive and finite")
     diameter = 2.0 * radius
-    # The approach waypoint is deliberately reached with the hand closed.  At
-    # that collision-checked waypoint the hand then opens completely before
-    # any vertical descent.  Only the closing position is radius-dependent.
-    preopen = 1.0
+    preopen = min(1.0, max(0.0, (diameter + opening_clearance_m) / maximum))
     grip = min(1.0, max(0.0, (diameter - grip_compression_m) / maximum))
     return preopen, min(grip, preopen)
 
@@ -354,23 +342,11 @@ def solve_collision_free_ik(
     required_edge_start: np.ndarray | None = None,
     target_axis_world: Iterable[float] | None = None,
     target_rpy_world: Iterable[float] | None = None,
-    maximum_nearest_position_error_m: float = (
-        MAXIMUM_NEAREST_IK_POSITION_ERROR_M
-    ),
 ) -> WorldIKResult:
-    """Try official IK and retain the closest safe position-only boundary point."""
-    if (
-        not math.isfinite(maximum_nearest_position_error_m)
-        or maximum_nearest_position_error_m < 0.0
-    ):
-        raise ValueError("maximum nearest IK position error must be finite and >= 0")
+    """Try official IK from deterministic seeds and reject colliding results."""
     last_result: WorldIKResult | None = None
-    nearest_result: WorldIKResult | None = None
-    nearest_error_m = math.inf
-    best_observed_error_m = math.inf
     target = tuple(float(value) for value in target_world_xyz)
     ik_solution_count = 0
-    position_only = target_axis_world is None and target_rpy_world is None
     for attempt in range(attempts):
         seed = (
             preferred_arm_pos
@@ -401,18 +377,9 @@ def solve_collision_free_ik(
                 else axis_result
             )
         last_result = result
-        position_error_m = result.position_error_m
-        best_observed_error_m = min(best_observed_error_m, position_error_m)
-        approximate_candidate = bool(
-            position_only
-            and not result.success
-            and position_error_m
-            <= maximum_nearest_position_error_m + 1e-12
-        )
-        if not result.success and not approximate_candidate:
+        if not result.success:
             continue
-        if result.success:
-            ik_solution_count += 1
+        ik_solution_count += 1
         active = np.asarray(result.active_arm, dtype=float)
         if not checker.state_valid(active):
             continue
@@ -420,19 +387,11 @@ def solve_collision_free_ik(
             required_edge_start, active
         ):
             continue
-        if result.success:
-            return result
-        if position_error_m < nearest_error_m:
-            nearest_result = result
-            nearest_error_m = position_error_m
-    if nearest_result is not None:
-        return replace(nearest_result, accepted_nearest=True)
+        return result
     suffix = ""
     if last_result is not None:
         suffix = (
             f"; final SDK error={last_result.sdk_result.error_norm:.6g}, "
-            f"best position error={best_observed_error_m:.6g} m, "
-            f"nearest limit={maximum_nearest_position_error_m:.6g} m, "
             f"message={last_result.sdk_result.message}"
         )
     target_text = "[" + ", ".join(f"{value:.6f}" for value in target) + "]"
@@ -532,32 +491,6 @@ def sample_waypoints_fixed_duration(
     return tuple(times), tuple(positions)
 
 
-def sample_dense_cartesian_ik_path(
-    waypoints: list[np.ndarray],
-    maximum_velocity_rad_s: float,
-    *,
-    rate_hz: float = 50.0,
-) -> tuple[tuple[float, ...], tuple[tuple[float, ...], ...]]:
-    """Time a dense IK path without adding a fixed pause at every IK sample."""
-
-    if len(waypoints) < 2:
-        raise ValueError("at least two dense IK waypoints are required")
-    weights = [
-        max(float(np.max(np.abs(goal - start))), 1e-9)
-        for start, goal in zip(waypoints, waypoints[1:])
-    ]
-    # sample_waypoints_fixed_duration allocates time in proportion to these
-    # weights.  The 1.875 factor is the peak derivative of minimum jerk.
-    minimum_duration = 1.875 * sum(weights) / maximum_velocity_rad_s
-    ticks = max(len(waypoints) - 1, int(math.ceil(minimum_duration * rate_hz)))
-    duration_s = ticks / rate_hz
-    return sample_waypoints_fixed_duration(
-        waypoints,
-        duration_s,
-        rate_hz=rate_hz,
-    )
-
-
 def measured_maximum_velocity(
     times: Iterable[float], positions: Iterable[Iterable[float]]
 ) -> float:
@@ -592,7 +525,7 @@ def plan_trajectory(
     vision_result: Path | None = None,
     robot_urdf: Path | None = None,
     table_clearance_m: float = 0.025,
-    approach_distance_m: float = 0.03,
+    approach_distance_m: float = 0.075,
     random_seed: int = 11,
 ) -> PlannedTrajectory:
     """Plan and densely verify one approach trajectory in MuJoCo."""
@@ -627,9 +560,6 @@ def plan_trajectory(
     if len(target) != 3 or not all(math.isfinite(value) for value in target):
         raise ValueError("target_world_xyz must contain three finite values")
     side_grasp = obstacle is not None and obstacle.target_object is not None
-    orientation_constrained_side_grasp = (
-        side_grasp and not SIDE_GRASP_POSITION_ONLY_IK
-    )
     if side_grasp and target_world_xyz is None:
         # Segmentation commonly returns the visible top surface.  A horizontal
         # side grasp must instead close around the object's modeled mid-height.
@@ -638,38 +568,15 @@ def plan_trajectory(
         obstacle.plane_normal if obstacle is not None else (0.0, 0.0, 1.0),
         dtype=float,
     )
-    object_top: np.ndarray | None = None
-    descent_distance_m = approach_distance_m
-    if side_grasp:
-        assert obstacle is not None and obstacle.target_object is not None
-        target_object = obstacle.target_object
-        object_center = np.asarray(target_object.object_center_m, dtype=float)
-        object_top = (
-            object_center
-            + 0.5 * target_object.object_height_m * approach_normal
-        )
-        target_height_from_center = float(
-            np.dot(np.asarray(target, dtype=float) - object_center, approach_normal)
-        )
-        descent_distance_m = (
-            0.5 * target_object.object_height_m
-            + approach_distance_m
-            - target_height_from_center
-        )
-        if descent_distance_m < 0.01:
-            raise ValueError(
-                "computed vertical descent must be at least 0.01 m; check the "
-                "object height, gripper center and pregrasp clearance"
-            )
     pregrasp = tuple(
         float(value)
         for value in np.asarray(target, dtype=float)
-        + descent_distance_m * approach_normal
+        + approach_distance_m * approach_normal
     )
     grasp_axis_world: np.ndarray | None = None
     opening_axis_world: np.ndarray | None = None
     target_rpy_world: tuple[float, float, float] | None = None
-    if orientation_constrained_side_grasp:
+    if side_grasp:
         heading = math.radians(SIDE_GRASP_APPROACH_HEADING_DEG)
         preferred_approach = np.asarray(
             (math.cos(heading), math.sin(heading), 0.0), dtype=float
@@ -722,77 +629,29 @@ def plan_trajectory(
         start_arm_pos[offset:offset + profile.arm_dof], dtype=float
     )
 
-    if not checker.state_valid(start_joints):
-        raise RuntimeError(
-            f"start pose is in collision: {checker.last_invalid_report}"
-        )
-    start_tcp = np.asarray(ik.fk_world(side, start_arm_pos), dtype=float)
-    safe_lift_distance_m = max(
-        0.03,
-        float(np.dot(np.asarray(pregrasp, dtype=float) - start_tcp, approach_normal)),
+    pregrasp_result = solve_collision_free_ik(
+        ik,
+        checker,
+        side,
+        pregrasp,
+        start_arm_pos,
+        rng,
+        target_axis_world=grasp_axis_world,
+        target_rpy_world=target_rpy_world,
     )
-    outward = np.asarray((0.0, 1.0 if side == "left" else -1.0, 0.0))
-    outward -= float(np.dot(outward, approach_normal)) * approach_normal
-    outward_norm = float(np.linalg.norm(outward))
-    if outward_norm <= 1e-9:
-        raise RuntimeError("table normal leaves no usable robot-side direction")
-    outward /= outward_norm
-    safe_staging = (
-        start_tcp
-        + safe_lift_distance_m * approach_normal
-        + SAFE_STAGING_OUTWARD_OFFSET_M * outward
-    )
-    transit_stage_paths: list[list[np.ndarray]] = []
-    previous_joints = start_joints
-    previous_arm_pos = start_arm_pos
-    previous_target = start_tcp
-    transit_segment_counts: list[int] = []
-    pregrasp_result: WorldIKResult | None = None
-    nearest_ik_fallbacks: list[dict[str, object]] = []
-    for stage_target in (safe_staging, np.asarray(pregrasp, dtype=float)):
-        stage_path = [previous_joints.copy()]
-        segment_distance = float(np.linalg.norm(stage_target - previous_target))
-        segment_count = max(4, int(math.ceil(segment_distance / 0.015)))
-        transit_segment_counts.append(segment_count)
-        for index in range(1, segment_count + 1):
-            cartesian_target = previous_target + (
-                index / segment_count
-            ) * (stage_target - previous_target)
-            pregrasp_result = solve_collision_free_ik(
-                ik,
-                checker,
-                side,
-                cartesian_target,
-                previous_arm_pos,
-                rng,
-                attempts=8,
-                required_edge_start=previous_joints,
-                target_axis_world=grasp_axis_world,
-                target_rpy_world=target_rpy_world,
-            )
-            if pregrasp_result.accepted_nearest:
-                nearest_ik_fallbacks.append(
-                    {
-                        "phase": "safe-staging-transfer",
-                        "requested_world_m": [
-                            float(value) for value in cartesian_target
-                        ],
-                        "resolved_world_m": list(
-                            pregrasp_result.final_world_xyz
-                        ),
-                        "position_error_m": pregrasp_result.position_error_m,
-                    }
-                )
-            previous_joints = np.asarray(pregrasp_result.active_arm, dtype=float)
-            previous_arm_pos = pregrasp_result.arm_pos
-            stage_path.append(previous_joints.copy())
-        transit_stage_paths.append(stage_path)
-        previous_target = stage_target
-    assert pregrasp_result is not None
     pregrasp_joints = np.asarray(pregrasp_result.active_arm, dtype=float)
-    transit_path = transit_stage_paths[0] + transit_stage_paths[1][1:]
+    lower, upper = ik.joint_limits_for_side(side)
+    path, rrt_report = plan_rrt(
+        start_joints,
+        pregrasp_joints,
+        checker,
+        lower,
+        upper,
+        rng,
+    )
+    transit_path = shortcut_path(path, checker, rng)
 
-    approach_segments = max(4, int(math.ceil(descent_distance_m / 0.015)))
+    approach_segments = max(4, int(math.ceil(approach_distance_m / 0.015)))
     previous_joints = pregrasp_joints
     previous_arm_pos = pregrasp_result.arm_pos
     final_result = pregrasp_result
@@ -815,33 +674,13 @@ def plan_trajectory(
             target_axis_world=grasp_axis_world,
             target_rpy_world=target_rpy_world,
         )
-        if final_result.accepted_nearest:
-            nearest_ik_fallbacks.append(
-                {
-                    "phase": "vertical-descent",
-                    "requested_world_m": [
-                        float(value) for value in cartesian_target
-                    ],
-                    "resolved_world_m": list(final_result.final_world_xyz),
-                    "position_error_m": final_result.position_error_m,
-                }
-            )
         previous_joints = np.asarray(final_result.active_arm, dtype=float)
         previous_arm_pos = final_result.arm_pos
         descent_path.append(previous_joints.copy())
 
-    safe_times, safe_positions = sample_dense_cartesian_ik_path(
-        transit_stage_paths[0], profile.maximum_velocity_rad_s
+    transit_times, transit_positions = sample_waypoints(
+        transit_path, profile.maximum_velocity_rad_s
     )
-    transfer_times, transfer_positions = sample_dense_cartesian_ik_path(
-        transit_stage_paths[1], profile.maximum_velocity_rad_s
-    )
-    safe_staging_time_s = safe_times[-1]
-    safe_staging_frame = len(safe_times) - 1
-    transit_times = safe_times + tuple(
-        round(safe_staging_time_s + value, 9) for value in transfer_times[1:]
-    )
-    transit_positions = safe_positions + transfer_positions[1:]
     descent_times, descent_positions = sample_waypoints(
         descent_path, profile.maximum_velocity_rad_s
     )
@@ -864,7 +703,6 @@ def plan_trajectory(
     )
     approach_axis_table_tilts_deg: list[float] = []
     opening_tilts_deg: list[float] = []
-    verified_tcp_positions: list[np.ndarray] = []
     descent_start_frame = len(transit_times) - 1
     for frame_index, position in enumerate(positions):
         if not verification_checker.state_valid(position):
@@ -872,10 +710,7 @@ def plan_trajectory(
                 "densely sampled trajectory is in collision: "
                 f"{verification_checker.last_invalid_report}"
             )
-        verified_tcp_positions.append(
-            np.asarray(simulation.site_world_xyz(side), dtype=float)
-        )
-        if orientation_constrained_side_grasp and frame_index >= descent_start_frame:
+        if side_grasp and frame_index >= descent_start_frame:
             rotation = simulation.site_world_rotation(side)
             tcp_axis = rotation[:, 2]
             approach_normal_component = float(np.clip(
@@ -889,75 +724,10 @@ def plan_trajectory(
                 abs(np.dot(opening_axis, approach_normal)), 0.0, 1.0
             ))
             opening_tilts_deg.append(math.degrees(math.asin(normal_component)))
-    verified_tcp = np.asarray(verified_tcp_positions, dtype=float)
-    safe_delta = safe_staging - start_tcp
-    safe_delta_norm = float(np.linalg.norm(safe_delta))
-    safe_direction = safe_delta / safe_delta_norm
-    safe_offsets = verified_tcp[: safe_staging_frame + 1] - start_tcp
-    safe_progress = safe_offsets @ safe_direction
-    safe_lateral = safe_offsets - safe_progress[:, None] * safe_direction
-    safe_path_maximum_deviation_m = float(
-        np.max(np.linalg.norm(safe_lateral, axis=1))
-    )
-    safe_path_minimum_forward_step_m = float(np.min(np.diff(safe_progress)))
-    safe_staging_final_error_m = float(
-        np.linalg.norm(verified_tcp[safe_staging_frame] - safe_staging)
-    )
-    transfer_height_errors = (
-        verified_tcp[safe_staging_frame : descent_start_frame + 1]
-        - safe_staging
-    ) @ approach_normal
-    safe_transfer_maximum_height_error_m = float(
-        np.max(np.abs(transfer_height_errors))
-    )
-    nearest_ik_fallback_used = bool(nearest_ik_fallbacks)
-    safe_path_deviation_limit_m = (
-        MAXIMUM_NEAREST_IK_POSITION_ERROR_M
-        if nearest_ik_fallback_used
-        else 0.01
-    )
-    endpoint_error_limit_m = (
-        MAXIMUM_NEAREST_IK_POSITION_ERROR_M
-        if nearest_ik_fallback_used
-        else 1e-3
-    )
-    transfer_height_error_limit_m = (
-        MAXIMUM_NEAREST_IK_POSITION_ERROR_M
-        if nearest_ik_fallback_used
-        else 0.01
-    )
-    if safe_path_maximum_deviation_m > safe_path_deviation_limit_m + 1e-12:
-        raise RuntimeError(
-            "robot-side safe-staging path deviates "
-            f"{safe_path_maximum_deviation_m:.6g} m from its verified line; "
-            f"limit={safe_path_deviation_limit_m:.6g} m"
-        )
-    if safe_path_minimum_forward_step_m < -1e-4:
-        raise RuntimeError(
-            "robot-side safe-staging path reverses instead of raising monotonically"
-        )
-    if safe_staging_final_error_m > endpoint_error_limit_m + 1e-12:
-        raise RuntimeError(
-            f"safe-staging endpoint error {safe_staging_final_error_m:.6g} m "
-            f"exceeds {endpoint_error_limit_m:.6g} m"
-        )
-    if (
-        safe_transfer_maximum_height_error_m
-        > transfer_height_error_limit_m + 1e-12
-    ):
-        raise RuntimeError(
-            "safe-staging transfer leaves its high clearance plane by "
-            f"{safe_transfer_maximum_height_error_m:.6g} m; "
-            f"limit={transfer_height_error_limit_m:.6g} m"
-        )
     maximum_approach_axis_table_tilt = (
-        max(approach_axis_table_tilts_deg)
-        if orientation_constrained_side_grasp
-        else None
+        max(approach_axis_table_tilts_deg) if side_grasp else None
     )
-    maximum_opening_tilt = (
-        max(opening_tilts_deg) if orientation_constrained_side_grasp else None
-    )
+    maximum_opening_tilt = max(opening_tilts_deg) if side_grasp else None
     if (
         maximum_approach_axis_table_tilt is not None
         and maximum_approach_axis_table_tilt > MAXIMUM_GRIPPER_AXIS_ERROR_DEG
@@ -975,29 +745,13 @@ def plan_trajectory(
             f"maximum tilt={maximum_opening_tilt:.3f} deg"
         )
 
-    actual_target = tuple(float(value) for value in verified_tcp[-1])
-    actual_pregrasp = tuple(
-        float(value) for value in verified_tcp[descent_start_frame]
-    )
-    resolved_target = actual_target if nearest_ik_fallback_used else target
-    resolved_pregrasp = (
-        actual_pregrasp if nearest_ik_fallback_used else pregrasp
-    )
     final_error = float(
-        np.linalg.norm(np.asarray(actual_target) - np.asarray(target))
-    )
-    if final_error > endpoint_error_limit_m + 1e-12:
-        raise RuntimeError(
-            f"final position error {final_error:.6g} m exceeds "
-            f"{endpoint_error_limit_m:.6g} m"
+        np.linalg.norm(
+            np.asarray(final_result.final_world_xyz) - np.asarray(target)
         )
-    nearest_ik_maximum_error_m = max(
-        (
-            float(item["position_error_m"])
-            for item in nearest_ik_fallbacks
-        ),
-        default=0.0,
     )
+    if final_error > 1e-3:
+        raise RuntimeError(f"final position error {final_error:.6g} m exceeds 1 mm")
     report: dict[str, object] = {
         "verified_collision_free": True,
         "trajectory_role": "approach",
@@ -1026,69 +780,18 @@ def plan_trajectory(
             if side_grasp and obstacle is not None
             else None
         ),
-        "estimated_object_height_m": (
-            obstacle.target_object.object_height_m
-            if side_grasp and obstacle is not None
-            else None
-        ),
-        "object_top_world_m": (
-            [float(value) for value in object_top]
-            if object_top is not None
-            else None
-        ),
-        "gripper_center_world_m": list(resolved_target),
-        "target_world_m": list(resolved_target),
-        "pregrasp_world_m": list(resolved_pregrasp),
-        "requested_gripper_center_world_m": list(target),
-        "requested_pregrasp_world_m": list(pregrasp),
-        "actual_gripper_center_world_m": list(actual_target),
-        "actual_pregrasp_world_m": list(actual_pregrasp),
-        "nearest_ik_fallback_used": nearest_ik_fallback_used,
-        "nearest_ik_fallback_limit_m": MAXIMUM_NEAREST_IK_POSITION_ERROR_M,
-        "nearest_ik_fallback_count": len(nearest_ik_fallbacks),
-        "nearest_ik_fallback_maximum_error_m": nearest_ik_maximum_error_m,
-        "nearest_ik_fallbacks": nearest_ik_fallbacks,
-        "planning_strategy": "robot_side_safe_staging_then_cartesian_grasp",
-        "safe_staging_world_m": [float(value) for value in safe_staging],
-        "safe_staging_lift_m": safe_lift_distance_m,
-        "safe_staging_outward_offset_m": SAFE_STAGING_OUTWARD_OFFSET_M,
-        "safe_staging_outward_direction_world": [
-            float(value) for value in outward
-        ],
-        "safe_staging_cartesian_segments": transit_segment_counts[0],
-        "safe_staging_to_pregrasp_cartesian_segments": transit_segment_counts[1],
-        "safe_staging_reached_time_s": safe_staging_time_s,
-        "safe_staging_reached_frame": safe_staging_frame,
-        "safe_staging_path_maximum_deviation_m": (
-            safe_path_maximum_deviation_m
-        ),
-        "safe_staging_path_minimum_forward_step_m": (
-            safe_path_minimum_forward_step_m
-        ),
-        "safe_staging_final_error_m": safe_staging_final_error_m,
-        "safe_transfer_maximum_height_error_m": (
-            safe_transfer_maximum_height_error_m
-        ),
-        "grasp_mode": (
-            "position_only_side_grasp"
-            if side_grasp and SIDE_GRASP_POSITION_ONLY_IK
-            else "horizontal_side_grasp"
-            if side_grasp
-            else "position_only"
-        ),
-        "orientation_ik_enabled": orientation_constrained_side_grasp,
-        "gripper_side_approach_local_axis": (
-            "+Z" if orientation_constrained_side_grasp else None
-        ),
+        "gripper_center_world_m": list(target),
+        "target_world_m": list(target),
+        "pregrasp_world_m": list(pregrasp),
+        "grasp_mode": "horizontal_side_grasp" if side_grasp else "position_only",
+        "gripper_side_approach_local_axis": "+Z" if side_grasp else None,
         "grasp_axis_world": (
             [float(value) for value in grasp_axis_world]
             if grasp_axis_world is not None
             else None
         ),
         "maximum_side_approach_table_tilt_deg": maximum_approach_axis_table_tilt,
-        "gripper_opening_local_axis": (
-            "+Y" if orientation_constrained_side_grasp else None
-        ),
+        "gripper_opening_local_axis": "+Y" if side_grasp else None,
         "gripper_opening_axis_world": (
             [float(value) for value in opening_axis_world]
             if opening_axis_world is not None
@@ -1109,32 +812,14 @@ def plan_trajectory(
         ),
         "nearest_table_body": verification_checker.nearest_table_body,
         "state_checks": checker.state_checks + verification_checker.state_checks,
-        "transit_waypoints": len(transit_path),
+        "rrt": {
+            **rrt_report,
+            "shortcut_waypoints": len(transit_path),
+        },
         "approach_segments": approach_segments,
         "vertical_descent_start_time_s": descent_start_time_s,
         "vertical_descent_start_frame": descent_start_frame,
-        "pregrasp_clearance_above_object_m": (
-            float(
-                np.dot(
-                    np.asarray(resolved_pregrasp) - object_top,
-                    approach_normal,
-                )
-            )
-            if object_top is not None and nearest_ik_fallback_used
-            else approach_distance_m
-            if object_top is not None
-            else None
-        ),
-        "requested_pregrasp_clearance_above_object_m": (
-            approach_distance_m if side_grasp else None
-        ),
-        "vertical_descent_distance_m": float(
-            np.dot(
-                np.asarray(resolved_pregrasp) - np.asarray(resolved_target),
-                approach_normal,
-            )
-        ),
-        "requested_vertical_descent_distance_m": descent_distance_m,
+        "vertical_descent_distance_m": approach_distance_m,
         "frame_count": len(times),
         "duration_s": times[-1],
         "maximum_velocity_rad_s": maximum_velocity,
@@ -1161,8 +846,8 @@ def plan_trajectory(
         side=side,
         obstacle=obstacle,
         visual_urdf_path=visual_urdf_path,
-        target_world_xyz=resolved_target,
-        pregrasp_world_xyz=resolved_pregrasp,
+        target_world_xyz=target,
+        pregrasp_world_xyz=pregrasp,
         joint_names=profile.joints_for_side(side),
         times=times,
         positions=positions,
@@ -1244,7 +929,6 @@ def plan_lift_trajectory(
     rng = np.random.default_rng(random_seed)
     segments = max(4, int(math.ceil(lift_height_m / 0.015)))
     final_result: WorldIKResult | None = None
-    nearest_ik_fallbacks: list[dict[str, object]] = []
     for index in range(1, segments + 1):
         target = start_target + (index / segments) * lift_height_m * direction
         final_result = solve_collision_free_ik(
@@ -1259,15 +943,6 @@ def plan_lift_trajectory(
             target_axis_world=grasp_axis_world,
             target_rpy_world=target_rpy_world,
         )
-        if final_result.accepted_nearest:
-            nearest_ik_fallbacks.append(
-                {
-                    "phase": "vertical-lift",
-                    "requested_world_m": [float(value) for value in target],
-                    "resolved_world_m": list(final_result.final_world_xyz),
-                    "position_error_m": final_result.position_error_m,
-                }
-            )
         previous_joints = np.asarray(final_result.active_arm, dtype=float)
         preferred_arm_pos = final_result.arm_pos
         path.append(previous_joints.copy())
@@ -1339,39 +1014,13 @@ def plan_lift_trajectory(
             "gripper opening direction is not parallel to the table during lift: "
             f"maximum tilt={maximum_opening_tilt:.3f} deg"
         )
-    resolved_lifted_target = np.asarray(
-        final_result.final_world_xyz, dtype=float
-    )
-    final_error = float(np.linalg.norm(resolved_lifted_target - lifted_target))
-    nearest_ik_fallback_used = bool(nearest_ik_fallbacks)
-    endpoint_error_limit_m = (
-        MAXIMUM_NEAREST_IK_POSITION_ERROR_M
-        if nearest_ik_fallback_used
-        else 1e-3
-    )
-    if final_error > endpoint_error_limit_m + 1e-12:
-        raise RuntimeError(
-            f"lift final position error {final_error:.6g} m exceeds "
-            f"{endpoint_error_limit_m:.6g} m"
-        )
-    actual_lift_displacement = resolved_lifted_target - start_target
-    actual_lift_progress_m = float(np.dot(actual_lift_displacement, direction))
-    actual_lift_lateral_m = float(
+    final_error = float(
         np.linalg.norm(
-            actual_lift_displacement - actual_lift_progress_m * direction
+            np.asarray(final_result.final_world_xyz) - lifted_target
         )
     )
-    if actual_lift_progress_m < 0.60 * lift_height_m:
-        raise RuntimeError(
-            "nearest IK lift endpoint does not preserve enough upward motion: "
-            f"progress={actual_lift_progress_m:.6g} m, "
-            f"minimum={0.60 * lift_height_m:.6g} m"
-        )
-    if actual_lift_lateral_m > MAXIMUM_NEAREST_IK_POSITION_ERROR_M + 1e-12:
-        raise RuntimeError(
-            "nearest IK lift endpoint drifts laterally by "
-            f"{actual_lift_lateral_m:.6g} m"
-        )
+    if final_error > 1e-3:
+        raise RuntimeError(f"lift final position error {final_error:.6g} m exceeds 1 mm")
     target_object = (
         approach.obstacle.target_object
         if approach.obstacle is not None
@@ -1383,7 +1032,7 @@ def plan_lift_trajectory(
         else None
     )
     object_center_lifted = (
-        object_center_start + actual_lift_displacement
+        object_center_start + lift_height_m * direction
         if object_center_start is not None
         else None
     )
@@ -1418,29 +1067,10 @@ def plan_lift_trajectory(
             else None
         ),
         "lift_start_gripper_center_world_m": list(approach.target_world_xyz),
-        "gripper_center_world_m": [
-            float(value) for value in resolved_lifted_target
-        ],
+        "gripper_center_world_m": [float(value) for value in lifted_target],
         "lift_start_world_m": list(approach.target_world_xyz),
-        "target_world_m": [float(value) for value in resolved_lifted_target],
-        "requested_target_world_m": [float(value) for value in lifted_target],
+        "target_world_m": [float(value) for value in lifted_target],
         "lift_direction_world": [float(value) for value in direction],
-        "actual_lift_displacement_world_m": [
-            float(value) for value in actual_lift_displacement
-        ],
-        "actual_lift_progress_m": actual_lift_progress_m,
-        "actual_lift_lateral_m": actual_lift_lateral_m,
-        "nearest_ik_fallback_used": nearest_ik_fallback_used,
-        "nearest_ik_fallback_limit_m": MAXIMUM_NEAREST_IK_POSITION_ERROR_M,
-        "nearest_ik_fallback_count": len(nearest_ik_fallbacks),
-        "nearest_ik_fallback_maximum_error_m": max(
-            (
-                float(item["position_error_m"])
-                for item in nearest_ik_fallbacks
-            ),
-            default=0.0,
-        ),
-        "nearest_ik_fallbacks": nearest_ik_fallbacks,
         "grasp_axis_world": (
             [float(value) for value in grasp_axis_world]
             if grasp_axis_world is not None
@@ -1471,7 +1101,7 @@ def plan_lift_trajectory(
         side=approach.side,
         obstacle=approach.obstacle,
         visual_urdf_path=approach.visual_urdf_path,
-        target_world_xyz=tuple(float(value) for value in resolved_lifted_target),
+        target_world_xyz=tuple(float(value) for value in lifted_target),
         pregrasp_world_xyz=approach.target_world_xyz,
         joint_names=approach.joint_names,
         times=times,
@@ -1587,122 +1217,6 @@ def plan_return_to_default_trajectory(
     )
 
 
-def plan_controlled_place_and_return_trajectory(
-    approach: PlannedTrajectory,
-    lift: PlannedTrajectory,
-) -> PlannedTrajectory:
-    """Reverse the verified lift and approach paths to place before retreating."""
-
-    if approach.profile != lift.profile or approach.side != lift.side:
-        raise ValueError("approach and lift profiles must match")
-    if approach.joint_names != lift.joint_names:
-        raise ValueError("approach and lift joint order must match")
-    if max(
-        abs(value - expected)
-        for value, expected in zip(lift.positions[0], approach.positions[-1])
-    ) > 1e-6:
-        raise ValueError("lift does not start at the approach endpoint")
-
-    lower_times = tuple(
-        round(lift.duration_s - value, 9) for value in reversed(lift.times)
-    )
-    lower_positions = tuple(reversed(lift.positions))
-    retreat_times = tuple(
-        round(approach.duration_s - value, 9)
-        for value in reversed(approach.times)
-    )
-    retreat_positions = tuple(reversed(approach.positions))
-    times = lower_times + tuple(
-        round(lift.duration_s + value, 9) for value in retreat_times[1:]
-    )
-    positions = lower_positions + retreat_positions[1:]
-    maximum_velocity = measured_maximum_velocity(times, positions)
-    if maximum_velocity > approach.profile.maximum_velocity_rad_s + 1e-6:
-        raise RuntimeError(
-            f"place/return trajectory velocity {maximum_velocity:.6g} exceeds "
-            "the robot profile limit"
-        )
-
-    ik = OfficialIK(approach.profile)
-    simulation = RobotSimulation(
-        approach.profile,
-        ik,
-        approach.obstacle,
-        visual_urdf_path=approach.visual_urdf_path,
-    )
-    table_clearance = approach.report.get("table_clearance_m")
-    verification = CollisionChecker(
-        simulation,
-        approach.side,
-        approach.profile.mc_start_arm_pos(),
-        float(table_clearance) if table_clearance is not None else 0.0,
-        edge_resolution_rad=0.01,
-    )
-    for previous, current in zip(positions, positions[1:]):
-        if not verification.edge_valid(previous, current):
-            raise RuntimeError(
-                "controlled place/return trajectory is in collision: "
-                f"{verification.last_invalid_report}"
-            )
-    final_arm_pos = verification.arm_pos_for(positions[-1])
-    final_world = ik.fk_world(approach.side, final_arm_pos)
-    report: dict[str, object] = {
-        "verified_collision_free": True,
-        "trajectory_role": "return_to_default",
-        "return_mode": "controlled_lower_then_reverse_approach",
-        "robot_profile": approach.profile.name,
-        "arm_side": approach.side,
-        "installed_gripper_side": INSTALLED_GRIPPER_SIDE,
-        "ik_backend": "x2_ik_sdk.X2ArmIKSolver",
-        "kinematic_urdf": str(ik.urdf_path),
-        "tool_pose_calibration": str(ik.tool_pose.source_path),
-        "robot_visual_urdf": (
-            str(approach.visual_urdf_path)
-            if approach.visual_urdf_path is not None
-            else None
-        ),
-        "start_pose": "lift_endpoint",
-        "placement_pose": "grasp_endpoint",
-        "target_pose": "mc_animation_default",
-        "placement_world_m": list(approach.target_world_xyz),
-        "target_world_m": [float(value) for value in final_world],
-        "controlled_lower_duration_s": lift.duration_s,
-        "open_hand_retreat_duration_s": (
-            approach.duration_s
-            - float(approach.report["vertical_descent_start_time_s"])
-        ),
-        "pregrasp_reached_time_s": (
-            lift.duration_s
-            + approach.duration_s
-            - float(approach.report["vertical_descent_start_time_s"])
-        ),
-        "retreat_duration_s": approach.duration_s,
-        "table_clearance_m": table_clearance,
-        "minimum_observed_table_distance_m": (
-            verification.minimum_table_distance_m
-            if approach.obstacle is not None
-            else None
-        ),
-        "nearest_table_body": verification.nearest_table_body,
-        "state_checks": verification.state_checks,
-        "frame_count": len(times),
-        "duration_s": times[-1],
-        "maximum_velocity_rad_s": maximum_velocity,
-    }
-    return PlannedTrajectory(
-        profile=approach.profile,
-        side=approach.side,
-        obstacle=approach.obstacle,
-        visual_urdf_path=approach.visual_urdf_path,
-        target_world_xyz=tuple(float(value) for value in final_world),
-        pregrasp_world_xyz=approach.target_world_xyz,
-        joint_names=approach.joint_names,
-        times=times,
-        positions=positions,
-        report=report,
-    )
-
-
 def plan_simulated_grasp_sequence(
     approach: PlannedTrajectory,
     *,
@@ -1730,10 +1244,7 @@ def plan_simulated_grasp_sequence(
         lift_height_m=lift_height_m,
         lift_duration_s=lift_duration_s,
     )
-    return_to_default = plan_controlled_place_and_return_trajectory(
-        approach,
-        lift,
-    )
+    return_to_default = plan_return_to_default_trajectory(lift)
     simulation = RobotSimulation(
         approach.profile,
         OfficialIK(approach.profile),
@@ -1769,40 +1280,8 @@ def plan_simulated_grasp_sequence(
         validate_state(approach.positions[-1], float(gripper), "radius_close")
     for joints in lift.positions:
         validate_state(joints, grip, "vertical_lift")
-    lower_duration_s = float(
-        return_to_default.report["controlled_lower_duration_s"]
-    )
-    placement_frame = max(
-        index
-        for index, value in enumerate(return_to_default.times)
-        if value <= lower_duration_s + 1e-9
-    )
-    pregrasp_reached_time_s = float(
-        return_to_default.report["pregrasp_reached_time_s"]
-    )
-    pregrasp_frame = max(
-        index
-        for index, value in enumerate(return_to_default.times)
-        if value <= pregrasp_reached_time_s + 1e-9
-    )
-    for joints in return_to_default.positions[: placement_frame + 1]:
-        validate_state(joints, grip, "controlled_lower")
     for gripper in np.linspace(grip, 1.0, 11):
-        validate_state(
-            return_to_default.positions[placement_frame],
-            float(gripper),
-            "placed_release",
-        )
-    for joints in return_to_default.positions[placement_frame : pregrasp_frame + 1]:
-        validate_state(joints, 1.0, "open_hand_retreat")
-    for gripper in np.linspace(1.0, 0.0, 11):
-        validate_state(
-            return_to_default.positions[pregrasp_frame],
-            float(gripper),
-            "reclose_at_pregrasp",
-        )
-    for joints in return_to_default.positions[pregrasp_frame:]:
-        validate_state(joints, 0.0, "return_to_default")
+        validate_state(lift.positions[-1], float(gripper), "release")
     report: dict[str, object] = {
         "verified_collision_free": True,
         "trajectory_role": "simulated_grasp_sequence",
@@ -1818,13 +1297,8 @@ def plan_simulated_grasp_sequence(
         "close_duration_s": GRIPPER_CLOSE_DURATION_S,
         "grasp_settle_duration_s": GRASP_SETTLE_DURATION_S,
         "lift_duration_s": lift.duration_s,
-        "lifted_hold_duration_s": LIFTED_HOLD_DURATION_S,
-        "controlled_lower_duration_s": lower_duration_s,
-        "open_hand_retreat_duration_s": float(
-            return_to_default.report["open_hand_retreat_duration_s"]
-        ),
         "release_duration_s": GRIPPER_RELEASE_DURATION_S,
-        "place_settle_duration_s": PLACE_SETTLE_DURATION_S,
+        "object_drop_duration_s": OBJECT_DROP_DURATION_S,
         "reclose_duration_s": GRIPPER_RECLOSE_DURATION_S,
         "maximum_descent_side_approach_table_tilt_deg": approach.report[
             "maximum_side_approach_table_tilt_deg"
@@ -1845,26 +1319,22 @@ def plan_simulated_grasp_sequence(
             + GRIPPER_CLOSE_DURATION_S
             + GRASP_SETTLE_DURATION_S
             + lift.duration_s
-            + LIFTED_HOLD_DURATION_S
             + GRIPPER_RELEASE_DURATION_S
-            + PLACE_SETTLE_DURATION_S
+            + OBJECT_DROP_DURATION_S
             + GRIPPER_RECLOSE_DURATION_S
             + return_to_default.duration_s,
             9,
         ),
         "phases": [
             "move_above_object",
-            "fully_open_gripper",
+            "open_for_visual_radius",
             "vertical_descent",
             "close_to_visual_radius",
             "grasp_settle",
             "vertical_lift",
-            "lifted_hold",
-            "controlled_lower",
-            "fully_open_placed_release",
-            "place_settle",
-            "open_hand_vertical_retreat",
-            "close_empty_gripper_at_pregrasp",
+            "fully_open_release",
+            "object_drop_to_table",
+            "close_empty_gripper",
             "return_to_default",
         ],
         "collision_state_checks": checks,
@@ -1981,22 +1451,11 @@ def replay_grasp_sequence(sequence: SimulatedGraspSequence) -> None:
     start_arm_pos = approach.profile.mc_start_arm_pos()
     descent_start = float(approach.report["vertical_descent_start_time_s"])
     descent_duration = approach.duration_s - descent_start
-    lower_duration = float(
-        sequence.return_to_default.report["controlled_lower_duration_s"]
-    )
-    open_retreat_duration = float(
-        sequence.return_to_default.report["open_hand_retreat_duration_s"]
-    )
-    closed_return_duration = (
-        sequence.return_to_default.duration_s
-        - lower_duration
-        - open_retreat_duration
-    )
     phase_ends: list[tuple[str, float]] = []
     cursor = descent_start
     phase_ends.append(("move_above_object", cursor))
     cursor += sequence.open_duration_s
-    phase_ends.append(("fully_open_gripper", cursor))
+    phase_ends.append(("open_for_visual_radius", cursor))
     cursor += descent_duration
     phase_ends.append(("vertical_descent", cursor))
     cursor += sequence.close_duration_s
@@ -2005,19 +1464,13 @@ def replay_grasp_sequence(sequence: SimulatedGraspSequence) -> None:
     phase_ends.append(("grasp_settle", cursor))
     cursor += sequence.lift.duration_s
     phase_ends.append(("vertical_lift", cursor))
-    cursor += sequence.lifted_hold_duration_s
-    phase_ends.append(("lifted_hold", cursor))
-    cursor += lower_duration
-    phase_ends.append(("controlled_lower", cursor))
     cursor += sequence.release_duration_s
-    phase_ends.append(("fully_open_placed_release", cursor))
-    cursor += sequence.place_settle_duration_s
-    phase_ends.append(("place_settle", cursor))
-    cursor += open_retreat_duration
-    phase_ends.append(("open_hand_vertical_retreat", cursor))
+    phase_ends.append(("fully_open_release", cursor))
+    cursor += sequence.object_drop_duration_s
+    phase_ends.append(("object_drop_to_table", cursor))
     cursor += sequence.reclose_duration_s
-    phase_ends.append(("close_empty_gripper_at_pregrasp", cursor))
-    cursor += closed_return_duration
+    phase_ends.append(("close_empty_gripper", cursor))
+    cursor += sequence.return_to_default.duration_s
     phase_ends.append(("return_to_default", cursor))
 
     initial_center = np.asarray(target_object.object_center_m, dtype=float)
@@ -2025,6 +1478,11 @@ def replay_grasp_sequence(sequence: SimulatedGraspSequence) -> None:
     object_tcp_offset = initial_center - np.asarray(
         approach.target_world_xyz, dtype=float
     )
+    lifted_center = initial_center + (
+        np.asarray(sequence.lift.target_world_xyz, dtype=float)
+        - np.asarray(approach.target_world_xyz, dtype=float)
+    )
+
     threads_before = set(threading.enumerate())
     window = viewer.launch_passive(simulation.model, simulation.data)
     viewer_threads = set(threading.enumerate()) - threads_before
@@ -2059,7 +1517,7 @@ def replay_grasp_sequence(sequence: SimulatedGraspSequence) -> None:
             attached = False
             if phase_name == "move_above_object":
                 arm = _interpolate_replay_position(approach, elapsed)
-            elif phase_name == "fully_open_gripper":
+            elif phase_name == "open_for_visual_radius":
                 arm = _interpolate_replay_position(approach, descent_start)
                 gripper = blend * sequence.preopen_position
             elif phase_name == "vertical_descent":
@@ -2080,45 +1538,24 @@ def replay_grasp_sequence(sequence: SimulatedGraspSequence) -> None:
                 arm = _interpolate_replay_position(sequence.lift, local_time)
                 gripper = sequence.grip_position
                 attached = True
-            elif phase_name == "lifted_hold":
+            elif phase_name == "fully_open_release":
                 arm = sequence.lift.positions[-1]
-                gripper = sequence.grip_position
-                attached = True
-            elif phase_name == "controlled_lower":
-                arm = _interpolate_replay_position(
-                    sequence.return_to_default, local_time
-                )
-                gripper = sequence.grip_position
-                attached = True
-            elif phase_name == "fully_open_placed_release":
-                arm = _interpolate_replay_position(
-                    sequence.return_to_default, lower_duration
-                )
                 gripper = sequence.grip_position + blend * (
                     1.0 - sequence.grip_position
                 )
                 attached = True
-            elif phase_name == "place_settle":
-                arm = _interpolate_replay_position(
-                    sequence.return_to_default, lower_duration
-                )
+            elif phase_name == "object_drop_to_table":
+                arm = sequence.lift.positions[-1]
                 gripper = 1.0
-            elif phase_name == "open_hand_vertical_retreat":
-                arm = _interpolate_replay_position(
-                    sequence.return_to_default,
-                    lower_duration + local_time,
+                object_center = lifted_center + blend * (
+                    initial_center - lifted_center
                 )
-                gripper = 1.0
-            elif phase_name == "close_empty_gripper_at_pregrasp":
-                arm = _interpolate_replay_position(
-                    sequence.return_to_default,
-                    lower_duration + open_retreat_duration,
-                )
+            elif phase_name == "close_empty_gripper":
+                arm = sequence.lift.positions[-1]
                 gripper = 1.0 - blend
             elif phase_name == "return_to_default":
                 arm = _interpolate_replay_position(
-                    sequence.return_to_default,
-                    lower_duration + open_retreat_duration + local_time,
+                    sequence.return_to_default, local_time
                 )
 
             simulation.set_side_joints(approach.side, arm, start_arm_pos)

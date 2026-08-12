@@ -1,11 +1,13 @@
 {
   "schema_version": 2,
+  "scene_name": "x2_ultra_right_omnipicker_table_demo",
   "surface_point_mujoco_m": [0.3666481438, -0.3553605768, 0.9072504747],
   "object_center_mujoco_m": [0.3666481438, -0.3553605768, 0.9],
   "gripper_center_mujoco_m": [0.3666481438, -0.3553605768, 0.91],
   "selected_detection": {
-    "class_name": "bottle",
-    "confidence": 0.95,
+    "class_name": "orange-capped pill bottle",
+    "confidence": 1.0,
+    "visual_radius_m": 0.035,
     "estimated_object_height_m": 0.2
   },
   "table_plane_mujoco": {

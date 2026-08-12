@@ -1,87 +1,82 @@
-# graspV2 现场指令
+# graspV2 现场速查
 
-把 `10.0.200.REPLACE_ME` 换成现场机 IP。
+完整说明和故障处理见
+[`docs/package_install_run_debug_zh.md`](docs/package_install_run_debug_zh.md)。本页只保留现场命令。
+比赛机的 OS/Agi/AimDK 快照和 Motion 接口详见
+[`docs/competition_robot_environment_motion_zh.md`](docs/competition_robot_environment_motion_zh.md)。
 
-## 1. 开发机上传
+## 首次部署
 
-```bash
-cd /home/GraspV2
-tar --exclude='.git' --exclude='.venv' --exclude='.planning-venv' \
-  --exclude='build' --exclude='install' --exclude='log' --exclude='output' \
-  -czf /tmp/graspv2.tar.gz .
-
-scp /tmp/graspv2.tar.gz \
-  svt@10.0.200.REPLACE_ME:/home/svt/
-scp /path/to/x2_camera_calibration.json \
-  svt@10.0.200.REPLACE_ME:/home/svt/x2_camera_calibration.json
-ssh svt@10.0.200.REPLACE_ME
-```
-
-## 2. 现场机部署
+联网机：
 
 ```bash
-mkdir -p /home/svt/Raicom2026-old/graspV2
-tar -xzf /home/svt/graspv2.tar.gz -C /home/svt/Raicom2026-old/graspV2
-cd /home/svt/Raicom2026-old/graspV2
-chmod +x run.sh run_vision.sh run_full_grasp_pipeline.sh tools/*.sh
+cd /path/to/GraspV2
+chmod +x run.sh run_vision.sh run_full_grasp_pipeline.sh offline_run.sh tools/*.sh
+./tools/fetch_official_aimdk_x2.sh
 ./tools/build_graspv2_with_installed_aimdk.sh
 source tools/setup_x2_mc_env.sh
 ```
 
-现场机没有 Python 环境时，仅首次执行：
+完全离线包：
 
 ```bash
-./tools/setup_orin_vision_env.sh
-/usr/bin/python3 -m venv .planning-venv
-.planning-venv/bin/python -m pip install -r requirements.txt
-```
-
-## 3. 检查
-
-```bash
-cd /home/svt/Raicom2026-old/graspV2
-source tools/setup_x2_mc_env.sh
-./run.sh --no-vision --headless
-ros2 run graspv2 x2_aimdk_hardware preflight --component all
-./run_full_grasp_pipeline.sh --target-class "orange-capped pill bottle" \
-  --camera-calibration /home/svt/x2_camera_calibration.json --plan-only
-```
-
-## 4. 真机执行
-
-确认急停、人员隔离、相机标定和右侧夹爪正常后：
-
-```bash
-cd /home/svt/Raicom2026-old/graspV2
-source tools/setup_x2_mc_env.sh
-./run_full_grasp_pipeline.sh --target-class "orange-capped pill bottle" \
-  --camera-calibration /home/svt/x2_camera_calibration.json \
-  --execute --confirm-calibrated
-```
-
-看到提示后输入 `RUN`。目标类别也可改为 `cup` 或 `"bag of corn bread"`。
-
-## 离线包最简指令
-
-首次安装：
-
-```bash
-cd /home/agi/graspv2-x2-ultra-offline
+cd /path/to/graspv2-x2-ultra-offline
 ./install_offline.sh
+source tools/setup_x2_mc_env.sh
 ```
 
-只规划、不驱动机器人：
+AimDK 必须与机器人固件匹配；旧固件先设置
+`GRASPV2_AIMDK_SETUP=/path/to/aimdk/install/setup.bash`。
+
+比赛机固定本机执行：
 
 ```bash
-cd /home/agi/graspv2-x2-ultra-offline
-./offline_run.sh --target-class cup --plan-only
+export GRASPV2_RUNTIME_PROFILE=competition
 ```
 
-确认急停、人员隔离、标定和右夹爪后执行：
+SVT/开发测试机固定测试 fallback：
 
 ```bash
-cd /home/agi/graspv2-x2-ultra-offline
-./offline_run.sh --target-class cup \
-  --camera-calibration /home/agi/x2_camera_calibration.json \
+export GRASPV2_RUNTIME_PROFILE=test
+```
+
+competition 使用 `/home/agi/aimdk/install/setup.bash` 和本机 `/tmp` animation，不会连接测试
+IP；test 才使用配置的 SSH 地址。夹爪统一调用项目根目录的
+`omnipicker_hand_student.py`。
+
+## 每次开机检查
+
+```bash
+source tools/setup_x2_mc_env.sh
+
+# 不连接机器人控制端
+./run.sh --no-vision --headless
+
+# 只读相机；失败不会自动切换 Orbbec 或历史图片
+./run_vision.sh --capture-backend x2-aimdk --capture-only
+
+# 只读 AimDK/关节/夹爪前检
+ros2 run graspv2 x2_aimdk_hardware preflight \
+  --component all --transport hal-joint
+
+# 现场采集、识别和规划，不发布控制命令
+./run_full_grasp_pipeline.sh \
+  --target-class cup \
+  --camera-calibration /path/to/x2_camera_calibration.json \
+  --plan-only
+```
+
+## 真机执行
+
+确认吊架/站立控制、急停、人员隔离、相机外参、TCP 和 OmniPicker 后：
+
+```bash
+./run_full_grasp_pipeline.sh \
+  --target-class cup \
+  --camera-calibration /path/to/x2_camera_calibration.json \
   --execute --confirm-calibrated
 ```
+
+提示后输入 `RUN`。首次联调不要使用 `--yes`。
+
+离线包把最后两条 `run_full_grasp_pipeline.sh` 命令替换为 `offline_run.sh`，参数不变。

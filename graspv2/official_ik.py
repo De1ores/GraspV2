@@ -20,10 +20,20 @@ class WorldIKResult:
     sdk_result: IKResult
     target_world_xyz: tuple[float, float, float]
     final_world_xyz: tuple[float, float, float]
+    accepted_nearest: bool = False
 
     @property
     def success(self) -> bool:
-        return self.sdk_result.success
+        return self.sdk_result.success or self.accepted_nearest
+
+    @property
+    def position_error_m(self) -> float:
+        return float(
+            np.linalg.norm(
+                np.asarray(self.final_world_xyz, dtype=float)
+                - np.asarray(self.target_world_xyz, dtype=float)
+            )
+        )
 
     @property
     def arm_pos(self) -> list[float]:
@@ -111,6 +121,51 @@ class OfficialIK:
         result = self.solver.solve_position(
             ArmSide(side),
             self.world_to_base(target_world),
+            current_arm_pos=current_arm_pos,
+        )
+        return WorldIKResult(
+            sdk_result=result,
+            target_world_xyz=target_world,
+            final_world_xyz=self.base_to_world(result.final_xyz),
+        )
+
+    def solve_world_position_axis(
+        self,
+        side: str,
+        target_world_xyz: Iterable[float],
+        target_axis_world: Iterable[float],
+        current_arm_pos: Iterable[float] | None = None,
+    ) -> WorldIKResult:
+        """Solve TCP position with its local +Z aligned to a world direction."""
+
+        target_world = tuple(float(value) for value in target_world_xyz)
+        result = self.solver.solve_position_axis(
+            ArmSide(side),
+            self.world_to_base(target_world),
+            (0.0, 0.0, 1.0),
+            target_axis_world,
+            current_arm_pos=current_arm_pos,
+        )
+        return WorldIKResult(
+            sdk_result=result,
+            target_world_xyz=target_world,
+            final_world_xyz=self.base_to_world(result.final_xyz),
+        )
+
+    def solve_world_pose(
+        self,
+        side: str,
+        target_world_xyz: Iterable[float],
+        target_rpy_world: Iterable[float],
+        current_arm_pos: Iterable[float] | None = None,
+    ) -> WorldIKResult:
+        """Solve a complete TCP pose expressed in the MuJoCo world frame."""
+
+        target_world = tuple(float(value) for value in target_world_xyz)
+        result = self.solver.solve_pose(
+            ArmSide(side),
+            self.world_to_base(target_world),
+            target_rpy_world,
             current_arm_pos=current_arm_pos,
         )
         return WorldIKResult(

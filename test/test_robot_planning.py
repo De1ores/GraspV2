@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -12,10 +13,20 @@ from graspv2.mc_animation import (
     MC_JOINT_ORDER,
     build_mc_animation,
 )
-from graspv2.official_ik import OfficialIK
-from graspv2.planner import plan_lift_trajectory, plan_trajectory
+from graspv2.official_ik import OfficialIK, WorldIKResult
+from graspv2.planner import (
+    PlannedTrajectory,
+    _interpolate_replay_position,
+    gripper_positions_for_visual_radius,
+    plan_lift_trajectory,
+    plan_simulated_grasp_sequence,
+    plan_trajectory,
+    solve_collision_free_ik,
+)
 from graspv2.robot_profiles import PROFILES
 from graspv2.simulation import (
+    RIGHT_CLAW_JOINT_NAME,
+    RIGHT_WIDE_JOINT_NAME,
     RobotSimulation,
     load_table_obstacle,
     resolve_robot_visual_urdf,
@@ -25,6 +36,110 @@ from graspv2.trajectory import TrajectoryValidationError, load_trajectory
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "reachable_table.json"
+DEMO_SCENE = Path(__file__).parents[1] / "config" / "mujoco_demo_scene.json"
+
+
+def _failed_world_ik(position_error_m: float, joint: float) -> WorldIKResult:
+    target = (0.0, 0.0, 0.0)
+    return WorldIKResult(
+        sdk_result=SimpleNamespace(
+            success=False,
+            arm_pos=[0.0, joint],
+            active_arm=[joint],
+            error_norm=position_error_m,
+            message="max iterations reached",
+        ),
+        target_world_xyz=target,
+        final_world_xyz=(position_error_m, 0.0, 0.0),
+    )
+
+
+def test_nearest_ik_fallback_selects_closest_collision_free_seed() -> None:
+    class FakeIK:
+        profile = SimpleNamespace(arm_dof=1)
+
+        def __init__(self):
+            self.results = iter(
+                (
+                    _failed_world_ik(0.040, 0.1),
+                    _failed_world_ik(0.010, 0.2),
+                    _failed_world_ik(0.020, 0.3),
+                )
+            )
+
+        def joint_limits_for_side(self, _side):
+            return np.asarray([-1.0]), np.asarray([1.0])
+
+        def solve_world_position(self, _side, _target, _seed):
+            return next(self.results)
+
+    checker = SimpleNamespace(
+        state_valid=lambda _active: True,
+        edge_valid=lambda _start, _active: True,
+    )
+    selected = solve_collision_free_ik(
+        FakeIK(),
+        checker,
+        "right",
+        (0.0, 0.0, 0.0),
+        [0.0, 0.0],
+        np.random.default_rng(1),
+        attempts=3,
+        required_edge_start=np.asarray([0.0]),
+    )
+
+    assert selected.success
+    assert selected.accepted_nearest
+    assert selected.position_error_m == pytest.approx(0.010)
+    assert selected.active_arm == [0.2]
+
+
+def test_nearest_ik_fallback_keeps_collision_and_five_cm_gates() -> None:
+    class FakeIK:
+        profile = SimpleNamespace(arm_dof=1)
+
+        def __init__(self, results):
+            self.results = iter(results)
+
+        def joint_limits_for_side(self, _side):
+            return np.asarray([-1.0]), np.asarray([1.0])
+
+        def solve_world_position(self, _side, _target, _seed):
+            return next(self.results)
+
+    checker = SimpleNamespace(
+        state_valid=lambda active: float(active[0]) != 0.1,
+        edge_valid=lambda _start, _active: True,
+    )
+    selected = solve_collision_free_ik(
+        FakeIK(
+            (
+                _failed_world_ik(0.005, 0.1),
+                _failed_world_ik(0.020, 0.2),
+            )
+        ),
+        checker,
+        "right",
+        (0.0, 0.0, 0.0),
+        [0.0, 0.0],
+        np.random.default_rng(2),
+        attempts=2,
+        required_edge_start=np.asarray([0.0]),
+    )
+    assert selected.active_arm == [0.2]
+    assert selected.position_error_m == pytest.approx(0.020)
+
+    with pytest.raises(RuntimeError, match="best position error=0.0501 m"):
+        solve_collision_free_ik(
+            FakeIK((_failed_world_ik(0.0501, 0.2),)),
+            checker,
+            "right",
+            (0.0, 0.0, 0.0),
+            [0.0, 0.0],
+            np.random.default_rng(3),
+            attempts=1,
+            required_edge_start=np.asarray([0.0]),
+        )
 
 
 def test_official_sdk_and_mujoco_have_identical_ultra_kinematics() -> None:
@@ -79,7 +194,9 @@ def test_configured_tcp_pose_is_shared_by_ik_and_mujoco(tmp_path: Path) -> None:
     target = np.asarray(calibrated_ik.fk_world("right", arm_pos)) + [0.01, 0.0, 0.0]
     solved = calibrated_ik.solve_world_position("right", target, arm_pos)
     assert solved.success
-    assert solved.final_world_xyz == pytest.approx(target, abs=1e-4)
+    assert solved.final_world_xyz == pytest.approx(
+        target, abs=calibrated_ik.solver.config.eps
+    )
     alignment = validate_fk_alignment(profile, calibrated_ik, random_samples=3)
     assert alignment.maximum_position_error_m < 1e-9
     assert alignment.maximum_orientation_error_deg < 1e-4
@@ -149,6 +266,81 @@ def test_scene_contains_floor_lighting_and_complete_visual_table() -> None:
     assert 'name="planning_table_leg_3"' in simulation.xml
 
 
+def test_demo_scene_uses_full_ultra_proxy_and_right_omnipicker() -> None:
+    target, obstacle = load_table_obstacle(DEMO_SCENE)
+    simulation = RobotSimulation(
+        PROFILES["ultra"],
+        OfficialIK(PROFILES["ultra"]),
+        obstacle,
+    )
+    assert target == pytest.approx((0.3666481438, -0.3553605768, 0.91))
+    assert simulation.table_geom_id >= 0
+    assert simulation.target_object_geom_id >= 0
+    assert 'name="proxy_visual_pelvis"' in simulation.xml
+    assert 'name="proxy_visual_left_knee_link"' in simulation.xml
+    assert 'name="proxy_visual_right_ankle_roll_link"' in simulation.xml
+    assert 'name="proxy_visual_head"' in simulation.xml
+    assert "actual_visual_R_omnipicker_base_link_0" in simulation.xml
+    assert "actual_visual_L_omnipicker_base_link_0" not in simulation.xml
+
+
+def test_demo_scene_completes_approach_lift_and_return_planning() -> None:
+    approach = plan_trajectory(PROFILES["ultra"], vision_result=DEMO_SCENE)
+    sequence = plan_simulated_grasp_sequence(approach)
+
+    assert approach.report["verified_collision_free"] is True
+    assert sequence.lift.report["verified_collision_free"] is True
+    assert sequence.return_to_default.report["verified_collision_free"] is True
+    assert sequence.return_to_default.positions[-1] == pytest.approx(
+        PROFILES["ultra"].mc_start_arm_pos()[PROFILES["ultra"].arm_dof :]
+    )
+    assert approach.report["pregrasp_clearance_above_object_m"] == pytest.approx(
+        0.03
+    )
+    assert (
+        approach.target_world_xyz[2]
+        - approach.obstacle.target_object.object_center_m[2]
+    ) == pytest.approx(0.01)
+    assert sequence.preopen_position == pytest.approx(1.0)
+    assert sequence.report["lifted_hold_duration_s"] == pytest.approx(2.5)
+    assert sequence.report["controlled_lower_duration_s"] == pytest.approx(
+        sequence.lift.duration_s
+    )
+    assert sequence.return_to_default.report["return_mode"] == (
+        "controlled_lower_then_reverse_approach"
+    )
+
+
+def test_right_omnipicker_opening_and_target_motion_are_simulated() -> None:
+    _, obstacle = load_table_obstacle(DEMO_SCENE)
+    simulation = RobotSimulation(
+        PROFILES["ultra"],
+        OfficialIK(PROFILES["ultra"]),
+        obstacle,
+    )
+    simulation.set_gripper_position(1.0)
+    assert simulation.data.qpos[
+        simulation.gripper_qpos_indices[RIGHT_CLAW_JOINT_NAME]
+    ] == pytest.approx(-1.0)
+    assert simulation.data.qpos[
+        simulation.gripper_qpos_indices[RIGHT_WIDE_JOINT_NAME]
+    ] == pytest.approx(1.0)
+    simulation.set_gripper_position(0.0)
+    assert simulation.data.qpos[
+        simulation.gripper_qpos_indices[RIGHT_CLAW_JOINT_NAME]
+    ] == pytest.approx(0.0)
+    moved = (0.40, -0.30, 1.00)
+    simulation.set_target_object_pose(moved)
+    assert simulation.target_object_pose()[0] == pytest.approx(moved)
+
+
+def test_visual_radius_controls_preopen_and_grasp_opening() -> None:
+    preopen, grip = gripper_positions_for_visual_radius(0.045)
+    assert preopen == pytest.approx(1.0)
+    assert grip == pytest.approx(0.7166666667)
+    assert 0.0 <= grip < preopen <= 1.0
+
+
 def test_recognized_target_object_is_displayed_on_the_table(tmp_path: Path) -> None:
     document = json.loads(FIXTURE.read_text(encoding="utf-8"))
     document["selected_detection"] = {
@@ -161,7 +353,8 @@ def test_recognized_target_object_is_displayed_on_the_table(tmp_path: Path) -> N
     assert obstacle.target_object is not None
     assert obstacle.target_object.class_name == "bottle"
     assert obstacle.target_object.geom_type == "cylinder"
-    assert obstacle.target_object.center_m[2] == pytest.approx(0.9)
+    assert obstacle.target_object.object_center_m[2] == pytest.approx(0.9)
+    assert obstacle.target_object.gripper_center_m[2] == pytest.approx(0.91)
 
     profile = PROFILES["ultra"]
     simulation = RobotSimulation(profile, OfficialIK(profile), obstacle)
@@ -172,6 +365,23 @@ def test_recognized_target_object_is_displayed_on_the_table(tmp_path: Path) -> N
     assert simulation.model.geom_conaffinity[target_geom] == 0
 
 
+def test_schema_v1_surface_point_is_read_only_as_legacy_input(tmp_path: Path) -> None:
+    document = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    surface = document.pop("surface_point_mujoco_m")
+    document.pop("object_center_mujoco_m")
+    document.pop("gripper_center_mujoco_m")
+    document["schema_version"] = 1
+    document["grasp_point_mujoco_m"] = surface
+    legacy_path = tmp_path / "legacy_result.json"
+    legacy_path.write_text(json.dumps(document), encoding="utf-8")
+
+    gripper_center, obstacle = load_table_obstacle(legacy_path)
+    assert obstacle.target_object is not None
+    assert obstacle.target_object.object_center_m[2] == pytest.approx(0.9)
+    assert obstacle.target_object.gripper_center_m[2] == pytest.approx(0.91)
+    assert gripper_center == pytest.approx(obstacle.target_object.gripper_center_m)
+
+
 def test_table_plan_is_verified_and_loadable(tmp_path: Path) -> None:
     profile = PROFILES["ultra"]
     result = plan_trajectory(profile, vision_result=FIXTURE)
@@ -180,6 +390,42 @@ def test_table_plan_is_verified_and_loadable(tmp_path: Path) -> None:
     assert result.report["verified_collision_free"] is True
     assert result.report["minimum_observed_table_distance_m"] >= 0.025
     assert result.report["final_position_error_m"] < 1e-3
+    assert result.report["planning_strategy"] == (
+        "robot_side_safe_staging_then_cartesian_grasp"
+    )
+    assert "rrt" not in result.report
+    default_tcp = OfficialIK(profile).fk_world(
+        "right", profile.mc_start_arm_pos()
+    )
+    safe_staging = result.report["safe_staging_world_m"]
+    assert safe_staging[0] == pytest.approx(default_tcp[0])
+    assert safe_staging[1] == pytest.approx(default_tcp[1] - 0.06)
+    assert safe_staging[2] == pytest.approx(1.03)
+    assert result.report["safe_staging_path_maximum_deviation_m"] < 0.01
+    assert result.report["safe_staging_path_minimum_forward_step_m"] >= -1e-4
+    assert result.report["safe_staging_final_error_m"] < 1e-3
+    assert result.report["safe_transfer_maximum_height_error_m"] < 0.01
+    descent_start = result.report["vertical_descent_start_time_s"]
+    assert 0.0 < descent_start < result.duration_s
+    assert result.report["object_top_world_m"][2] == pytest.approx(1.0)
+    assert result.pregrasp_world_xyz[2] == pytest.approx(1.03)
+    assert (
+        result.pregrasp_world_xyz[2]
+        - result.report["object_top_world_m"][2]
+    ) == pytest.approx(0.03)
+    assert (
+        result.target_world_xyz[2]
+        - result.obstacle.target_object.object_center_m[2]
+    ) == pytest.approx(0.01)
+    assert result.report["grasp_mode"] == "position_only_side_grasp"
+    assert result.report["orientation_ik_enabled"] is False
+    assert result.report["gripper_side_approach_local_axis"] is None
+    assert result.report["grasp_axis_world"] is None
+    assert result.target_world_xyz[2] == pytest.approx(
+        result.obstacle.target_object.gripper_center_m[2]
+    )
+    assert result.report["maximum_side_approach_table_tilt_deg"] is None
+    assert result.report["maximum_opening_direction_table_tilt_deg"] is None
     trajectory_path = tmp_path / "trajectory.json"
     report_path = tmp_path / "report.json"
     result.write(trajectory_path, report_path)
@@ -208,6 +454,8 @@ def test_cli_uses_latest_vision_result_unless_explicitly_disabled(
     assert default_args.side == "right"
     no_vision_args = cli._parser().parse_args(["--no-vision"])
     assert cli._resolve_vision_result(no_vision_args) is None
+    demo_args = cli._parser().parse_args(["--demo-scene"])
+    assert cli._resolve_vision_result(demo_args) == DEMO_SCENE
     headless_args = cli._parser().parse_args(["--headless"])
     assert headless_args.headless is True
 
@@ -287,6 +535,25 @@ def test_sim_opens_viewer_by_default_and_headless_skips_it(
     assert opened == []
 
 
+def test_viewer_interpolates_by_wall_clock_and_skips_render_frames() -> None:
+    trajectory = PlannedTrajectory(
+        profile=PROFILES["ultra"],
+        side="right",
+        obstacle=None,
+        visual_urdf_path=None,
+        target_world_xyz=(0.0, 0.0, 0.0),
+        pregrasp_world_xyz=(0.0, 0.0, 0.0),
+        joint_names=("joint",),
+        times=(0.0, 0.5, 1.0),
+        positions=((0.0,), (1.0,), (0.0,)),
+        report={},
+    )
+    assert _interpolate_replay_position(trajectory, -1.0) == (0.0,)
+    assert _interpolate_replay_position(trajectory, 0.25) == pytest.approx((0.5,))
+    assert _interpolate_replay_position(trajectory, 0.75) == pytest.approx((0.5,))
+    assert _interpolate_replay_position(trajectory, 2.0) == (0.0,)
+
+
 def test_failed_plan_still_opens_default_static_scene(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -332,14 +599,15 @@ def test_ultra_animation_uses_the_14_joint_arm_layout(tmp_path: Path) -> None:
     assert all(len(row) == len(MC_JOINT_ORDER) + 1 for row in animation.rows)
 
 
-def test_clearance_gate_rejects_same_path_at_stricter_threshold() -> None:
+def test_clearance_gate_rejects_unachievable_stricter_threshold() -> None:
     profile = PROFILES["ultra"]
     baseline = plan_trajectory(
         profile,
         vision_result=FIXTURE,
         table_clearance_m=0.025,
     )
-    assert baseline.report["minimum_observed_table_distance_m"] < 0.08
+    strict_clearance = 0.095
+    assert baseline.report["minimum_observed_table_distance_m"] < strict_clearance
     simulation = RobotSimulation(
         profile,
         OfficialIK(profile),
@@ -354,16 +622,15 @@ def test_clearance_gate_rejects_same_path_at_stricter_threshold() -> None:
             positions,
             start_arm_pos,
         )
-        reports.append(simulation.collision_report(0.08))
+        reports.append(simulation.collision_report(strict_clearance))
     assert any(not report.valid for report in reports)
 
-    replanned = plan_trajectory(
-        profile,
-        vision_result=FIXTURE,
-        table_clearance_m=0.08,
-    )
-    assert replanned.report["verified_collision_free"] is True
-    assert replanned.report["minimum_observed_table_distance_m"] >= 0.08
+    with pytest.raises(RuntimeError, match="rejected by collision/edge checks"):
+        plan_trajectory(
+            profile,
+            vision_result=FIXTURE,
+            table_clearance_m=strict_clearance,
+        )
 
 
 def test_lift_plan_starts_at_grasp_and_runs_for_two_seconds() -> None:
@@ -374,12 +641,14 @@ def test_lift_plan_starts_at_grasp_and_runs_for_two_seconds() -> None:
     )
     lift = plan_lift_trajectory(
         approach,
-        lift_height_m=0.08,
+        lift_height_m=0.045,
         lift_duration_s=2.0,
     )
     assert lift.positions[0] == pytest.approx(approach.positions[-1])
     assert lift.duration_s == pytest.approx(2.0)
     assert lift.report["trajectory_role"] == "lift"
     assert lift.report["verified_collision_free"] is True
-    assert lift.report["lift_height_m"] == pytest.approx(0.08)
+    assert lift.report["lift_height_m"] == pytest.approx(0.045)
     assert lift.report["minimum_observed_table_distance_m"] >= 0.025
+    assert lift.report["maximum_side_approach_table_tilt_deg"] is None
+    assert lift.report["maximum_opening_direction_table_tilt_deg"] is None

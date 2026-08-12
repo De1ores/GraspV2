@@ -6,6 +6,12 @@ __pycache__/
 htmlcov/
 *.egg-info/
 /.venv/
+/.planning-venv/
+/.vision-venv/
+/.planning-venv.backup.*/
+/.vision-venv.backup.*/
+/.runtime/
+/.offline-install.complete
 
 # ROS 2 / colcon build products
 /build/
@@ -19,4 +25,5 @@ htmlcov/
 /dist/
 /offline/wheelhouse/
 /offline/runtime/
+/offline/pip-cache/
 /mobileclip2_b.ts

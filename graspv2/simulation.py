@@ -24,13 +24,20 @@ import numpy as np
 from .official_ik import OfficialIK
 from .robot_profiles import INSTALLED_GRIPPER_SIDE, RobotProfile
 from .tool_pose import ToolPoseConfig
+from .vision_geometry import DEFAULT_SIDE_GRASP_HEIGHT_OFFSET_M
 
 
 TABLE_GEOM_NAME = "planning_table"
+TARGET_OBJECT_BODY_NAME = "recognized_target_body"
 TARGET_OBJECT_GEOM_NAME = "recognized_target_object"
-TARGET_GRASP_SITE_NAME = "recognized_target_grasp_point"
+TARGET_GRIPPER_CENTER_SITE_NAME = "recognized_target_gripper_center"
 LEFT_SITE_NAME = "left_omnipicker_tcp"
 RIGHT_SITE_NAME = "right_omnipicker_tcp"
+RIGHT_CLAW_JOINT_NAME = "right_claw_joint"
+RIGHT_WIDE_JOINT_NAME = "R_hand_wide1_joint"
+OMNIPICKER_MAX_GRASP_DIAMETER_M = 0.12
+COLLISION_CLEARANCE_NUMERICAL_TOLERANCE_M = 1e-4
+SIDE_GRASP_HEIGHT_OFFSET_M = DEFAULT_SIDE_GRASP_HEIGHT_OFFSET_M
 ROBOT_URDF_ENV = "GRASPV2_ROBOT_URDF"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OMNIPICKER_DESCRIPTION = (
@@ -86,12 +93,14 @@ def _rpy_matrix(rpy: Iterable[float]) -> np.ndarray:
 @dataclass(frozen=True)
 class TargetObjectVisual:
     class_name: str
-    center_m: tuple[float, float, float]
-    grasp_point_m: tuple[float, float, float]
+    object_center_m: tuple[float, float, float]
+    gripper_center_m: tuple[float, float, float]
+    object_height_m: float
     quaternion_wxyz: tuple[float, float, float, float]
     geom_type: str
     size_m: tuple[float, ...]
     rgba: tuple[float, float, float, float]
+    visual_radius_m: float
 
 
 @dataclass(frozen=True)
@@ -141,6 +150,8 @@ def _target_object_shape(
         return "cylinder", (0.045, 0.055), 0.055, (0.95, 0.62, 0.10, 1.0)
     if "bowl" in normalized:
         return "cylinder", (0.075, 0.03), 0.03, (0.30, 0.72, 0.34, 1.0)
+    if "bag" in normalized or "corn bread" in normalized:
+        return "box", (0.065, 0.035, 0.085), 0.085, (0.92, 0.72, 0.18, 1.0)
     if "keyboard" in normalized:
         return "box", (0.14, 0.055, 0.012), 0.012, (0.18, 0.20, 0.24, 1.0)
     if "remote" in normalized:
@@ -156,7 +167,7 @@ def _target_object_shape(
 
 def _target_object_visual(
     document: dict[str, object],
-    target: tuple[float, float, float],
+    legacy_surface_point: tuple[float, float, float] | None,
     table_center: tuple[float, float, float],
     table_quaternion: tuple[float, float, float, float],
     table_half_extents: tuple[float, float, float],
@@ -170,27 +181,102 @@ def _target_object_visual(
         return None
     class_name = raw_class_name.strip()
     geom_type, size, half_height, rgba = _target_object_shape(class_name)
-    normal = np.asarray(table_normal, dtype=float)
-    table_top = np.asarray(table_center, dtype=float) + normal * table_half_extents[2]
-    target_array = np.asarray(target, dtype=float)
-    projected = target_array - normal * float(np.dot(target_array - table_top, normal))
-    center = projected + normal * half_height
+    raw_object_height = selected.get("estimated_object_height_m")
+    if raw_object_height is None:
+        object_height = 2.0 * half_height
+    elif isinstance(raw_object_height, bool) or not isinstance(
+        raw_object_height, (int, float)
+    ):
+        raise ValueError("selected_detection.estimated_object_height_m must be a number")
+    else:
+        object_height = float(raw_object_height)
+    if not math.isfinite(object_height) or object_height <= 0.0:
+        raise ValueError("selected_detection.estimated_object_height_m must be positive")
+    raw_visual_radius = selected.get("visual_radius_m")
+    if raw_visual_radius is None:
+        visual_radius = float(size[0])
+    elif isinstance(raw_visual_radius, bool) or not isinstance(
+        raw_visual_radius, (int, float)
+    ):
+        raise ValueError("selected_detection.visual_radius_m must be a number")
+    else:
+        visual_radius = float(raw_visual_radius)
+    if not math.isfinite(visual_radius) or visual_radius <= 0.0:
+        raise ValueError("selected_detection.visual_radius_m must be positive")
+    raw_object_center = document.get("object_center_mujoco_m")
+    raw_gripper_center = document.get("gripper_center_mujoco_m")
+    if raw_object_center is not None or raw_gripper_center is not None:
+        if raw_object_center is None or raw_gripper_center is None:
+            raise ValueError(
+                "vision result must provide both object_center_mujoco_m and "
+                "gripper_center_mujoco_m"
+            )
+        object_center = _finite_vector(
+            raw_object_center, 3, "object center"
+        )
+        gripper_center = _finite_vector(
+            raw_gripper_center, 3, "gripper center"
+        )
+    else:
+        # Explicit schema-v1 compatibility. Old results mislabeled one visible
+        # surface sample as grasp_point_mujoco_m, so reconstruct the same class-
+        # prior center used by the former planner instead of treating it as a
+        # measured object or gripper center.
+        if legacy_surface_point is None:
+            raise ValueError(
+                "vision result has no object/gripper centers or legacy surface point"
+            )
+        normal = np.asarray(table_normal, dtype=float)
+        table_top = (
+            np.asarray(table_center, dtype=float)
+            + normal * table_half_extents[2]
+        )
+        target_array = np.asarray(legacy_surface_point, dtype=float)
+        projected = target_array - normal * float(
+            np.dot(target_array - table_top, normal)
+        )
+        legacy_center = projected + normal * half_height
+        object_center = tuple(float(value) for value in legacy_center)
+        gripper_center = tuple(
+            float(value)
+            for value in legacy_center + normal * SIDE_GRASP_HEIGHT_OFFSET_M
+        )
     return TargetObjectVisual(
         class_name=class_name,
-        center_m=tuple(float(value) for value in center),
-        grasp_point_m=target,
+        object_center_m=object_center,
+        gripper_center_m=gripper_center,
+        object_height_m=object_height,
         quaternion_wxyz=table_quaternion,
         geom_type=geom_type,
         size_m=size,
         rgba=rgba,
+        visual_radius_m=visual_radius,
     )
 
 
 def load_table_obstacle(path: Path) -> tuple[tuple[float, float, float], TableObstacle]:
-    """Load the grasp point and fitted table box emitted by the vision pipeline."""
+    """Load the gripper center and fitted table box emitted by vision."""
     source = path.expanduser().resolve()
     document = json.loads(source.read_text(encoding="utf-8"))
-    target = _finite_vector(document.get("grasp_point_mujoco_m"), 3, "grasp point")
+    raw_gripper_center = document.get("gripper_center_mujoco_m")
+    raw_legacy_surface = document.get("grasp_point_mujoco_m")
+    legacy_surface = (
+        _finite_vector(raw_legacy_surface, 3, "legacy surface point")
+        if raw_legacy_surface is not None
+        else None
+    )
+    if raw_gripper_center is not None:
+        gripper_center = _finite_vector(
+            raw_gripper_center, 3, "gripper center"
+        )
+    elif legacy_surface is not None:
+        # Replaced with the reconstructed center below when selected_detection
+        # is available. Retain this value for old position-only scene files.
+        gripper_center = legacy_surface
+    else:
+        raise ValueError(
+            "vision result is missing gripper_center_mujoco_m"
+        )
     table = document.get("table_plane_mujoco")
     if not isinstance(table, dict):
         raise ValueError("table_plane_mujoco is missing")
@@ -224,13 +310,17 @@ def load_table_obstacle(path: Path) -> tuple[tuple[float, float, float], TableOb
         normal = tuple(-value for value in normal)
     target_object = _target_object_visual(
         document,
-        target,
+        legacy_surface,
         center,
         quat,
         half_extents,
         normal,
     )
-    return target, TableObstacle(center, quat, half_extents, normal, target_object)
+    if target_object is not None:
+        gripper_center = target_object.gripper_center_m
+    return gripper_center, TableObstacle(
+        center, quat, half_extents, normal, target_object
+    )
 
 
 @dataclass(frozen=True)
@@ -574,6 +664,129 @@ def _add_link_proxy(
         )
 
 
+def _add_full_body_proxy_visual(
+    body: ET.Element,
+    link_name: str,
+    child_joints: list[_UrdfJoint],
+) -> None:
+    """Draw non-colliding primitives when the SDK URDF has no visual meshes."""
+
+    common = {
+        "contype": "0",
+        "conaffinity": "0",
+        "density": "0",
+        "group": "2",
+    }
+    blue = "0.16 0.42 0.72 0.92"
+    dark = "0.12 0.18 0.27 0.96"
+    joint = "0.26 0.62 0.88 0.96"
+
+    if link_name == "pelvis":
+        ET.SubElement(
+            body,
+            "geom",
+            name="proxy_visual_pelvis",
+            type="box",
+            pos="0 0 0.025",
+            size="0.12 0.105 0.07",
+            rgba=dark,
+            **common,
+        )
+        return
+    if link_name in {"waist_yaw_link", "waist_pitch_link"}:
+        ET.SubElement(
+            body,
+            "geom",
+            name=f"proxy_visual_{link_name}",
+            type="cylinder",
+            pos="0 0 0.035",
+            size="0.075 0.045",
+            rgba=joint,
+            **common,
+        )
+        return
+    if link_name == "head_yaw_link":
+        ET.SubElement(
+            body,
+            "geom",
+            name="proxy_visual_neck",
+            type="cylinder",
+            pos="0 0 0.035",
+            size="0.045 0.05",
+            rgba=joint,
+            **common,
+        )
+        return
+    if link_name == "head_pitch_link":
+        ET.SubElement(
+            body,
+            "geom",
+            name="proxy_visual_head",
+            type="ellipsoid",
+            pos="0.025 0 0.075",
+            size="0.09 0.075 0.105",
+            rgba=dark,
+            **common,
+        )
+        return
+    if link_name == "lidar_chest_front":
+        ET.SubElement(
+            body,
+            "geom",
+            name="proxy_visual_chest_lidar",
+            type="cylinder",
+            size="0.035 0.025",
+            rgba="0.05 0.07 0.09 1",
+            **common,
+        )
+        return
+    if "ankle_roll_link" in link_name:
+        ET.SubElement(
+            body,
+            "geom",
+            name=f"proxy_visual_{link_name}",
+            type="box",
+            pos="0.045 0 -0.05",
+            size="0.105 0.048 0.025",
+            rgba=dark,
+            **common,
+        )
+        return
+    if "ankle_pitch_link" in link_name or "hip_pitch_link" in link_name:
+        ET.SubElement(
+            body,
+            "geom",
+            name=f"proxy_visual_{link_name}",
+            type="sphere",
+            size="0.055",
+            rgba=joint,
+            **common,
+        )
+        return
+    leg_segment_tokens = ("hip_roll_link", "hip_yaw_link", "knee_link")
+    if any(token in link_name for token in leg_segment_tokens):
+        next_joint = next(
+            (
+                candidate
+                for candidate in child_joints
+                if np.linalg.norm(candidate.xyz) > 0.08
+            ),
+            None,
+        )
+        if next_joint is not None:
+            vector = np.asarray(next_joint.xyz, dtype=float)
+            ET.SubElement(
+                body,
+                "geom",
+                name=f"proxy_visual_{link_name}",
+                type="capsule",
+                fromto=_format(tuple(vector * 0.08) + tuple(vector * 0.92)),
+                size="0.052" if "hip" in link_name else "0.045",
+                rgba=blue,
+                **common,
+            )
+
+
 def _build_mjcf(
     profile: RobotProfile,
     urdf_path: Path,
@@ -625,6 +838,7 @@ def _build_mjcf(
     for joint in selected.values():
         children.setdefault(joint.parent, []).append(joint)
     active = set(profile.arm_pos_order)
+    active.update((RIGHT_CLAW_JOINT_NAME, RIGHT_WIDE_JOINT_NAME))
 
     root = ET.Element("mujoco", model=f"graspv2_{profile.name}")
     ET.SubElement(root, "compiler", angle="radian", autolimits="true")
@@ -765,6 +979,14 @@ def _build_mjcf(
                     range=_format((joint.lower, joint.upper)),
                     damping="0.2",
                 )
+                if joint.name in (RIGHT_CLAW_JOINT_NAME, RIGHT_WIDE_JOINT_NAME):
+                    ET.SubElement(
+                        body,
+                        "inertial",
+                        pos="0 0 0",
+                        mass="0.01",
+                        diaginertia="1e-5 1e-5 1e-5",
+                    )
             is_omnipicker = joint.child in omnipicker_visuals
             for index, visual in enumerate(visuals.get(joint.child, ())):
                 ET.SubElement(
@@ -793,10 +1015,16 @@ def _build_mjcf(
                     pos="0.02 0 0.10",
                     size="0.105 0.10 0.20",
                     rgba=(
-                        "0.5 0.5 0.55 0.35"
+                        "0.22 0.38 0.62 0.82"
                         if not robot_visuals
                         else "0.5 0.5 0.55 0"
                     ),
+                )
+            if not robot_visuals:
+                _add_full_body_proxy_visual(
+                    body,
+                    joint.child,
+                    children.get(joint.child, []),
                 )
             _add_link_proxy(
                 body,
@@ -864,13 +1092,30 @@ def _build_mjcf(
             )
         if obstacle.target_object is not None:
             target_object = obstacle.target_object
-            ET.SubElement(
+            target_rotation = np.empty(9, dtype=float)
+            mujoco.mju_quat2Mat(
+                target_rotation,
+                np.asarray(target_object.quaternion_wxyz, dtype=float),
+            )
+            target_rotation = target_rotation.reshape(3, 3)
+            local_gripper_center = target_rotation.T @ (
+                np.asarray(target_object.gripper_center_m, dtype=float)
+                - np.asarray(target_object.object_center_m, dtype=float)
+            )
+            target_body = ET.SubElement(
                 world,
+                "body",
+                name=TARGET_OBJECT_BODY_NAME,
+                mocap="true",
+                pos=_format(target_object.object_center_m),
+                quat=_format(target_object.quaternion_wxyz),
+            )
+            ET.SubElement(
+                target_body,
                 "geom",
                 name=TARGET_OBJECT_GEOM_NAME,
                 type=target_object.geom_type,
-                pos=_format(target_object.center_m),
-                quat=_format(target_object.quaternion_wxyz),
+                pos="0 0 0",
                 size=_format(target_object.size_m),
                 rgba=_format(target_object.rgba),
                 contype="0",
@@ -879,11 +1124,11 @@ def _build_mjcf(
                 group="2",
             )
             ET.SubElement(
-                world,
+                target_body,
                 "site",
-                name=TARGET_GRASP_SITE_NAME,
+                name=TARGET_GRIPPER_CENTER_SITE_NAME,
                 type="sphere",
-                pos=_format(target_object.grasp_point_m),
+                pos=_format(local_gripper_center),
                 size="0.009",
                 rgba="0.15 1 0.2 1",
                 group="2",
@@ -937,6 +1182,16 @@ class RobotSimulation:
             if joint_id < 0:
                 raise RuntimeError(f"simulation joint is missing: {name}")
             self.qpos_indices[name] = int(self.model.jnt_qposadr[joint_id])
+        self.gripper_qpos_indices: dict[str, int] = {}
+        for name in (RIGHT_CLAW_JOINT_NAME, RIGHT_WIDE_JOINT_NAME):
+            joint_id = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_JOINT, name
+            )
+            if joint_id < 0:
+                raise RuntimeError(f"simulation gripper joint is missing: {name}")
+            self.gripper_qpos_indices[name] = int(
+                self.model.jnt_qposadr[joint_id]
+            )
         self.site_ids = {
             "left": mujoco.mj_name2id(
                 self.model, mujoco.mjtObj.mjOBJ_SITE, LEFT_SITE_NAME
@@ -951,7 +1206,23 @@ class RobotSimulation:
         self.target_object_geom_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_GEOM, TARGET_OBJECT_GEOM_NAME
         )
+        self.target_object_body_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, TARGET_OBJECT_BODY_NAME
+        )
+        self.target_object_mocap_id = (
+            int(self.model.body_mocapid[self.target_object_body_id])
+            if self.target_object_body_id >= 0
+            else -1
+        )
+        target_object = obstacle.target_object if obstacle is not None else None
+        self.target_object_initial_center_m = (
+            target_object.object_center_m if target_object is not None else None
+        )
+        self.target_object_initial_quaternion_wxyz = (
+            target_object.quaternion_wxyz if target_object is not None else None
+        )
         self.set_arm_pos(ik.ready_arm_pos())
+        self.set_gripper_position(0.0)
 
     def set_arm_pos(self, arm_pos: Iterable[float]) -> None:
         values = tuple(float(value) for value in arm_pos)
@@ -961,6 +1232,56 @@ class RobotSimulation:
             )
         for name, value in zip(self.profile.arm_pos_order, values):
             self.data.qpos[self.qpos_indices[name]] = value
+        mujoco.mj_forward(self.model, self.data)
+
+    def set_gripper_position(self, position: float) -> None:
+        """Set normalized right OmniPicker opening (0=closed, 1=fully open)."""
+
+        value = float(position)
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError("gripper position must be within [0, 1]")
+        self.data.qpos[
+            self.gripper_qpos_indices[RIGHT_CLAW_JOINT_NAME]
+        ] = -value
+        self.data.qpos[
+            self.gripper_qpos_indices[RIGHT_WIDE_JOINT_NAME]
+        ] = value
+        mujoco.mj_forward(self.model, self.data)
+
+    def target_object_pose(
+        self,
+    ) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+        if self.target_object_mocap_id < 0:
+            raise RuntimeError("simulation has no recognized target object")
+        position = tuple(
+            float(value) for value in self.data.mocap_pos[self.target_object_mocap_id]
+        )
+        quaternion = tuple(
+            float(value) for value in self.data.mocap_quat[self.target_object_mocap_id]
+        )
+        return position, quaternion
+
+    def set_target_object_pose(
+        self,
+        center_m: Iterable[float],
+        quaternion_wxyz: Iterable[float] | None = None,
+    ) -> None:
+        """Move the recognized target mocap body without enabling fake contacts."""
+
+        if self.target_object_mocap_id < 0:
+            raise RuntimeError("simulation has no recognized target object")
+        center = np.asarray(tuple(center_m), dtype=float)
+        if center.shape != (3,) or not np.all(np.isfinite(center)):
+            raise ValueError("target object center must contain three finite values")
+        self.data.mocap_pos[self.target_object_mocap_id] = center
+        if quaternion_wxyz is not None:
+            quaternion = np.asarray(tuple(quaternion_wxyz), dtype=float)
+            norm = float(np.linalg.norm(quaternion))
+            if quaternion.shape != (4,) or not np.all(np.isfinite(quaternion)):
+                raise ValueError("target quaternion must contain four finite values")
+            if norm <= 1e-12:
+                raise ValueError("target quaternion must be non-zero")
+            self.data.mocap_quat[self.target_object_mocap_id] = quaternion / norm
         mujoco.mj_forward(self.model, self.data)
 
     def set_side_joints(
@@ -1038,7 +1359,11 @@ class RobotSimulation:
         else:
             table_distance, nearest_body = self.probe_distance_m, None
         return CollisionReport(
-            valid=table_distance + 1e-9 >= clearance_m and not self_contacts,
+            valid=(
+                table_distance + COLLISION_CLEARANCE_NUMERICAL_TOLERANCE_M
+                >= clearance_m
+                and not self_contacts
+            ),
             minimum_table_distance_m=table_distance,
             nearest_table_body=nearest_body,
             self_contacts=tuple(sorted(set(self_contacts))),

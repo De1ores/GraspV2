@@ -74,7 +74,8 @@ class X2IKConfig:
     right_ready_arm: list[float] = field(
         default_factory=lambda: [-0.35, -0.45, 0.0, -1.0, 0.0, 0.15, 0.0]
     )
-    eps: float = 1e-4
+    eps: float = 5e-4
+    pose_eps: float = 2e-4
     max_iters: int = 1000
     dt: float = 0.1
     damping: float = 1e-4

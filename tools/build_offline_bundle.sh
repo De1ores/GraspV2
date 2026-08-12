@@ -9,14 +9,7 @@ stage_parent="$(mktemp -d)"
 stage="$stage_parent/$bundle_name"
 trap 'rm -rf -- "$stage_parent"' EXIT
 
-for required in \
-  "$repo_dir/offline/wheelhouse/aarch64/planning" \
-  "$repo_dir/offline/wheelhouse/aarch64/vision" \
-  "$repo_dir/offline/runtime/libcusparse_lt-linux-aarch64-0.7.1.0-archive.tar.xz" \
-  "$repo_dir/mobileclip2_b.ts" \
-  "$repo_dir/yoloe-26s-seg.pt"; do
-  [[ -e "$required" ]] || { echo "Missing offline asset: $required" >&2; exit 1; }
-done
+python3 "$repo_dir/tools/check_offline_assets.py" --root "$repo_dir"
 
 mkdir -p "$stage" "$dist_dir"
 tar -C "$repo_dir" \
@@ -24,7 +17,10 @@ tar -C "$repo_dir" \
   --exclude=.venv \
   --exclude=.planning-venv \
   --exclude=.vision-venv \
+  --exclude='.planning-venv.backup.*' \
+  --exclude='.vision-venv.backup.*' \
   --exclude=.runtime \
+  --exclude=.offline-install.complete \
   --exclude=.pytest_cache \
   --exclude=__pycache__ \
   --exclude='*/__pycache__' \
@@ -33,6 +29,8 @@ tar -C "$repo_dir" \
   --exclude=log \
   --exclude=dist \
   --exclude=output \
+  --exclude=offline/runtime/aimdk-x2-v1.0.0 \
+  --exclude=offline/pip-cache \
   --exclude=offline/MANIFEST.sha256 \
   -cf - . | tar -C "$stage" -xf -
 

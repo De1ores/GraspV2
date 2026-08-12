@@ -1,278 +1,165 @@
-# X2 真机接口接入说明
+# X2 真机接口契约
 
-本文说明 graspV2 为上肢、OmniPicker 和 RGB-D 深度数据预留的硬件边界。规划与
-MuJoCo 仍是纯离线模块；只有显式运行真机桥接命令时才会加载 ROS 2/AimDK。
+本文只记录 GraspV2 与 X2/AimDK 的技术边界。安装、常用命令和故障处理统一见
+[`package_install_run_debug_zh.md`](package_install_run_debug_zh.md)。规划与 MuJoCo 是离线模块；
+只有显式真机命令才加载控制接口。
 
-## 接口对应关系
+比赛机的实测 OS/Agi/AimDK 环境、统一 source 顺序、Motion 消息布局和输入源仲裁见
+[`competition_robot_environment_motion_zh.md`](competition_robot_environment_motion_zh.md)。
 
-| 功能 | AimDK 接口 | graspV2 入口 |
+## 1. 接口对应关系
+
+| 功能 | AimDK/ROS 接口 | GraspV2 入口 |
 | --- | --- | --- |
-| MC 上半身分控 | `/mc/upper_body_command` (`UpperBodyCommandArray`) | `trajectory --transport upper-body` |
-| MC 模式切换 | `GetMcAction`、`SetMcAction` | 自动检查 `STAND_DEFAULT`，进入/退出 `UPPERBODY_REMOTE_SPLIT` |
-| 双臂命令/反馈 | `/aima/hal/joint/arm/command`、`state` | `x2_aimdk_hardware` |
-| 腰部命令/反馈 | `/aima/hal/joint/waist/command`、`state` | `command_joint_group("waist", ...)` |
-| 头部命令/反馈 | `/aima/hal/joint/head/command`、`state` | `command_joint_group("head", ...)` |
-| OmniPicker 命令/反馈 | `/aima/hal/joint/hand/command`、`state` | `x2_aimdk_hardware omnipicker` |
-| X2 RGB 图像 | `/aima/hal/sensor/rgbd_head_front/rgb_image` | `run_vision.sh --capture-backend x2-aimdk` |
-| X2 深度图像 | `/aima/hal/sensor/rgbd_head_front/depth_image` | 同上 |
-| RGB/Depth 内参 | 对应 `rgb_camera_info`、`depth_camera_info` | 同时订阅并写入 `camera.json` |
+| RGB 图像 | `/aima/hal/sensor/rgbd_head_front/rgb_image` | `run_vision.sh --capture-backend x2-aimdk` |
+| 深度图像 | `/aima/hal/sensor/rgbd_head_front/depth_image` | 同上 |
+| RGB/Depth 内参 | 对应 `rgb_camera_info`、`depth_camera_info` | 同步采集并写入 `camera.json` |
+| 旧 MC 上半身分控 | `/mc/upper_body_command`、`UpperBodyCommandArray` | `trajectory --transport upper-body` |
+| MC 模式/输入源 | `Get/SetMcAction`、`Get/SetMcInputSource` | 分控进入、激活和恢复 |
+| MC animation | `SetMcPresetMotion(ani_path)` | animation 播放及安全回退 |
+| 双臂 HAL | `/aima/hal/joint/arm/command`、`state` | 显式 `hal-joint` |
+| 腰/头 HAL | 对应 `/waist/`、`/head/` command/state | 保持与健康检查 |
+| OmniPicker | `/aima/hal/joint/hand/command`、`state` | 右侧夹爪命令和反馈 |
 
-topic、控制增益、反馈超时和夹爪参数集中在
-`config/x2_aimdk_hardware.json`。如真机固件 namespace 不同，只修改这份配置，不要改规划
-代码。
+所有 topic、服务、频率和门限集中在
+[`config/x2_aimdk_hardware.json`](../config/x2_aimdk_hardware.json)。现场 namespace 不同时只修改
+该配置，不要把 topic 写死到规划器。
 
-比赛参考 `omnipicker_hand_student.py` 的夹爪专用契约已单独落实：现场仅右手安装
-OmniPicker，逻辑关节名为 `right_claw_joint`，左侧命令数组保持为空；command QoS 为
-`BEST_EFFORT + TRANSIENT_LOCAL`
-（depth 10），以 50 Hz 连续发布 2 秒；非目标侧使用 `HandType.NONE` 且命令列表为空。
-比赛配置默认 `require_feedback=false`，与参考程序的 command-only 契约一致；如果 state topic
-存在仍会检查新鲜反馈和 fault。现场确认反馈稳定后可改为 `true`，此时没有反馈或最终位置
-超差都会阻止成功返回。
+## 2. RGB-D 契约
 
-AimDK v1.0 已取消深度点云，graspV2 因此只依赖标准 `sensor_msgs/Image` 和两套
-`CameraInfo`。X2 文档将 RGB 与深度帧都标记为 `rgbd_head_front`；内参不同时，采集器
-会把深度逐点重投影到 RGB 像素网格。若真机报告两个不同 `frame_id`，程序会拒绝拼接，
-必须先提供真实的 depth-to-RGB 外参。
+`x2-aimdk` 后端使用系统 Python 和 `rclpy` 订阅官方 ROS topic，不直接启动 X2 相机 C/C++
+SDK。采集器要求：
+
+- RGB、Depth 和两套 CameraInfo 都在超时前到达；
+- RGB/Depth 时间差不超过配置门限；
+- Image 与对应 CameraInfo 的尺寸和 `frame_id` 一致；
+- RGB 与 Depth `frame_id` 相同，否则缺少真实外参，拒绝拼接；
+- 深度转换为 `uint16` 后配准到 RGB 像素网格。
+
+完整流水线默认使用 `auto`：先走 `x2-aimdk`，四个 topic 未能在超时前同步时，采集器以
+专用退出码 20 通知入口切换到同一相机的本地 Orbbec SDK。数据契约失败不触发回退；显式
+`x2-aimdk` 也不回退。任何真机执行都禁止 `existing`，因此不会使用历史图片。
+
+图像方向默认 `auto`：每次实时采集先保持 `0°`，只有桌面拟合失败状态 42 才同步切换 RGB、
+Depth、内参和畸变参数到 `180°`。自动模式分别把两者当作正装/倒装安装假设，使用通过3D
+桌面门的假设和标称外参；不会套用另一台机器的方向字段做二次补偿。目标未识别及其他视觉错误不触发旋转。显式
+`calibrated` 才直接读取正装 `upright/0` 或倒装 `inverted/180` 配置。完整流水线的初次识别和
+两次视觉复检使用同一策略和标定文件；方向切换不更换采集设备，也不能替代外参标定。
+
+输出 `camera.json` 记录源 topic、编码、深度比例、配准方式、时间差和最终图像方向。
+
+## 3. OmniPicker 契约
+
+比赛机只在右侧安装 OmniPicker，逻辑关节为 `right_claw_joint`：
+
+- 左侧 `HandType.NONE`，命令数组为空；
+- 右侧 `HandType` 为 OmniPicker，归一化位置 `0=闭合、1=全开`；
+- command QoS 为 `BEST_EFFORT + TRANSIENT_LOCAL`，depth 10；
+- 默认 50 Hz 连续发布 2 秒；
+- `require_feedback=false` 时允许比赛参考程序的 command-only 模式，但若收到新鲜反馈仍检查
+  fault 和掉落状态；
+- 设置 `require_feedback=true` 后，无反馈或最终位置超差都会失败。
+
+设备 ID、CAN/EtherCAT、手型和固件不由 GraspV2 修改。
+
+animation 的夹爪事件统一调用项目根目录 `omnipicker_hand_student.py` 中的
+`OmniPickerStudentNode.publish_command("right", position)`，不在 20 列 CSV 中伪造 hand
+列。比赛机 profile 要求 SDK 可加载且初始命令成功；测试 profile 保留 command-only/
+未接控制线时的 best-effort 验证行为。
+
+## 4. AimDK 版本能力
+
+官方 AimDK v1.0.0 的项目实测能力为：
+
+```text
+animation, base, hal-joint, omnipicker
+```
+
+它没有旧 `UpperBodyCommandArray`。旧固件/overlay 只有通过
+`tools/check_aimdk_overlay.py --require-capability upper-body` 后才能使用 MC 分控。SDK 与机器人
+固件必须配套，不能只为通过导入而混用消息包。
 
 参考官方文档：
 
+- [SDK 获取与固件匹配](https://x2-aimdk.agibot.com/zh-cn/latest/get_sdk/index.html)
+- [更新日志](https://x2-aimdk.agibot.com/zh-cn/latest/changelog.html)
 - [关节控制](https://x2-aimdk.agibot.com/zh-cn/latest/Interface/control_mod/joint_control.html)
 - [末端执行器控制](https://x2-aimdk.agibot.com/zh-cn/latest/Interface/control_mod/endeffector.html)
-- [传感器与 RGB-D topic](https://x2-aimdk.agibot.com/zh-cn/latest/Interface/hal/sensor.html)
+- [传感器接口](https://x2-aimdk.agibot.com/zh-cn/latest/Interface/hal/sensor.html)
 
-## 三种深度采集方式
+## 5. MC upper-body 状态机
 
-### X2 真机 AimDK topic
+单条轨迹使用旧 MC 分控时按以下顺序执行：
 
-只采一帧，不运行识别：
+1. 校验双臂、头部反馈新鲜度、故障、温度、静止速度和轨迹起点；
+2. 要求当前 MC 为 `STAND_DEFAULT/100`；
+3. 注册并启用 `graspv2` 输入源；
+4. 进入 `UPPERBODY_REMOTE_SPLIT` 并确认 command topic 有订阅者；
+5. 持续发布当前保持帧，等待 MC 选中 `graspv2`；
+6. 以 50 Hz 发布头部 2 轴和双臂固定 14 槽目标，同时检查跟踪误差；
+7. 正常或异常退出均尝试恢复 `STAND_DEFAULT`。
 
-```bash
-./run_vision.sh --capture-backend x2-aimdk --capture-only
+输入源默认优先级为 65、超时为 1000 ms。停止发布后 MC 应自动交还控制；更高优先级安全
+来源仍可接管。
+
+### Competition 本机 upper-body 与 animation 回退
+
+程序在连接机器人前把同一条官方 IK + MuJoCo 验证轨迹转换为 MC animation。CSV 保持
+20 列手臂格式，播放器调用仓库内 `omnipicker_hand_student.py` SDK。完整抓取 animation
+包含安全预备、全开、下降、按半径闭合、抬升/悬停、受控放下、松开、张开撤离、空夹爪
+闭合和回默认位；不包含可阻塞播放的中间视觉门。程序显式记录计划轨迹是否开始；输入源激活
+HOLD 帧及开始运动前的空夹爪闭合仍允许关闭分控节点并启动 animation。
+
+`GRASPV2_RUNTIME_PROFILE=competition` 时，完整抓取先尝试比赛机本机 upper-body；任一运动前
+能力、服务、模式、输入源、订阅者、起点或初始夹爪检查失败时进入本机 animation。`test`
+profile 使用测试机 upper-body 和 SSH animation。两者都只允许在计划轨迹开始前切换；运动
+开始后或视觉失败时禁止从头重放。比赛机主通道的夹爪事件也直接调用仓库
+`omnipicker_hand_student.py`，SDK 运行期间持续发送 upper-body 保持帧。
+
+- 计划抓取轨迹已经启动；
+- animation 前检不满足稳定模式、健康、静止或默认起点；
+- 调用者选择低层 HAL；
+- 运动开始后的视觉、跟踪或夹爪错误。
+
+现场还存在一种 AimDK 混合 overlay：机器人按旧布局发布相邻的 `coil_temp/motor_temp`，本机
+v1.0 类型却把两个字节显示为一个 `error_code`，常见十进制值约为 12000。程序只在整帧至少
+四个关节都能解码为 `5–125°C` 的成对温度时启用兼容解释，并照常执行 80°C 超温门；单个
+非零错误码不会被兼容逻辑吞掉。
+
+## 6. HAL 边界
+
+`hal-joint` 是显式低层后备，绝不自动启用。使用它意味着现场已经处理原生 MC 控制权，并
+有人或上层控制器负责所有维持机器人安全所需的关节；吊架/固定底座、实体急停和人员隔离
+必须就绪。
+
+## 7. 完整视觉抓取状态机
+
+完整 `grasp` 使用 MC upper-body 和独立 hand HAL：
+
+```text
+闭合空夹爪在机器人一侧向外 6 cm 并抬高到安全预备点
+→ 保持高位移动到物体上方预抓点
+→ 在物体估计顶部上方 3 cm 处完全打开
+→ 垂直下降到物体中值高度上方 1 cm
+→ 按视觉半径夹紧和稳定等待
+→ 闭合后视觉门
+→ 垂直抬升
+→ 防掉落视觉门
+→ 在抬升点保持约 2.5 秒
+→ 夹紧状态沿抬升轨迹受控下降并放回原位
+→ 完全打开释放并等待物体稳定
+→ 全开垂直退回预抓点
+→ 闭合空夹爪并返回 SD 初始位
 ```
 
-当前 X2 头部 RGB-D 为倒装，默认对配准后的 RGB、深度和相机内参同步旋转
-`180°`。相机改为正装后使用 `--image-rotation-deg 0` 关闭该修正。
+视觉检查期间持续发布保持帧。任何运动开始后的识别、位置、跟踪或控制错误都保持故障关闭。
+只允许在计划轨迹开始前降级为单条 animation；它会做尽力而为的张开/闭合和原路
+返回，但没有中间视觉门，不能宣称等价于完整 `grasp` 状态机。
 
-采集后直接识别：
+## 8. 代码边界
 
-```bash
-./run_vision.sh --capture-backend x2-aimdk \
-  --classes "orange-capped pill bottle" \
-  --target-class "orange-capped pill bottle" --device 0
-```
-
-可通过 `--color-topic`、`--depth-topic`、`--rgb-camera-info-topic` 和
-`--depth-camera-info-topic` 临时覆盖配置。
-
-官方文档要求原始 RGB-D 大带宽 topic 只在相机所在开发计算单元 PC2 使用，不要跨计算
-单元订阅。
-
-### 当前测试机手动 Orbbec SDK
-
-保留现有 C++ SDK 采集器：
-
-```bash
-./tools/build_orbbec_capture.sh
-./run_vision.sh --capture-backend orbbec-sdk --capture-only
-```
-
-也可以完全手动调用 SDK，再让 graspV2 只消费结果：
-
-```bash
-./build/orbbec_capture --output ./output --warmup 20
-./run_vision.sh --capture-backend existing \
-  --classes "orange-capped pill bottle" \
-  --target-class "orange-capped pill bottle" --device 0
-```
-
-三个后端都使用相同文件契约：`color.png`、对齐到 RGB 的 `depth.png`、`camera.json`，
-因此后面的 YOLOE、桌面拟合和抓取规划不需要区分相机来源。
-
-注意：当前 `config/mujoco_camera_calibration.json` 的说明与变换来自测试机 Orbbec。
-X2 头部 RGB-D 必须单独完成 camera-to-MuJoCo/robot 外参标定，并通过
-`--camera-calibration PATH` 或 YOLOE 的 `--calibration PATH` 指定；不能复用测试机外参。
-
-完整流水线也支持选择后端：
-
-```bash
-# X2 真机 topic（默认）
-./run_full_grasp_pipeline.sh --target-class "orange-capped pill bottle"
-
-# 当前测试机直接调用 Orbbec SDK
-./run_full_grasp_pipeline.sh --target-class "orange-capped pill bottle" \
-  --capture-backend orbbec-sdk \
-  --verification-capture-backend orbbec-sdk
-
-# 已经手动采好 RGB-D 文件，但尚未识别
-./run_full_grasp_pipeline.sh --target-class "orange-capped pill bottle" \
-  --capture-backend existing
-```
-
-`existing` 只适用于初始离线规划。真机闭合后和抬升后必须重新采集，默认回到 X2 topic；
-测试机可显式选择 `--verification-capture-backend orbbec-sdk`。任何检查点都不会复用旧的
-`result.json`。
-
-## 上肢与 OmniPicker 真机桥接
-
-先验证已安装的 AimDK，并用通过接口检查的 overlay 构建 GraspV2。选择器会检查 MC、
-`UpperBodyCommandArray`、输入源服务、`JointCommandArray`、`HandCommandArray` 和对应状态
-消息，不会仅因为某个 `setup.bash` 存在就加载它：
-
-```bash
-./tools/select_aimdk_setup.sh
-./tools/build_graspv2_with_installed_aimdk.sh
-source tools/setup_x2_mc_env.sh
-```
-
-需要指定非默认安装位置时，先设置
-`GRASPV2_AIMDK_SETUP=/path/to/aimdk/install/setup.bash`；指定的 overlay 同样必须通过
-接口检查。不再内置一套可能与现场固件不一致的 AimDK 消息副本。
-
-只读检查 Ultra 双臂和右侧 OmniPicker：
-
-```bash
-ros2 run graspv2 x2_aimdk_hardware preflight \
-  --component all --transport upper-body
-```
-
-轨迹和夹爪命令默认只做本地校验，不发布：
-
-```bash
-ros2 run graspv2 x2_aimdk_hardware trajectory \
-  --trajectory output/planned_trajectory.json \
-  --transport upper-body
-
-ros2 run graspv2 x2_aimdk_hardware omnipicker \
-  --action open
-```
-
-### 上半身 MC 分控（默认）
-
-`trajectory` 默认使用 `--transport upper-body`。执行时会按下面顺序工作：
-
-启动新 ROS 参与者时，每个必需的 MC 服务各自最多等待 `15 s` 完成 DDS 发现；该超时与
-关节反馈的 `2 s` 超时分开，避免后注册的 `SetMcInputSource` 端点被前面服务耗尽等待窗口。
-等待期间不会发布命令或调用服务。
-
-1. 从 HAL 读取手臂和头部反馈，校验反馈新鲜度、静止速度、故障、温度和轨迹起点误差；
-2. 通过 `GetMcAction` 要求当前为 `STAND_DEFAULT/100`，并读取当前 MC 输入源；
-3. 通过 `SetMcInputSource` 注册并启用独立的 `graspv2` 输入源。默认优先级 `65`，
-   高于测试机的 `app_proxy/60`，但不会覆盖更高优先级的 RC 安全控制；停止发布后会在
-   `1000 ms` 超时并自动交还控制；
-4. 通过 `SetMcAction` 进入 `UPPERBODY_REMOTE_SPLIT`，确认
-   `/mc/upper_body_command` 已有 MC 订阅者；
-5. 先保持当前姿态，确认 `GetCurrentInputSource` 已切换到 `graspv2`，再以 50 Hz 发布头
-   2 轴、双臂固定 14 槽的目标，并监测实时跟踪误差；
-6. 正常完成或异常退出时，都尝试恢复 `STAND_DEFAULT`。
-
-测试机的 Fast DDS 构建会把常规发现和端点匹配事件标成 `Warning`。GraspV2 在创建首个
-DDS participant 前默认将 Fast DDS 限制到 `Error`，保留 ROS 节点自身的正常状态、警告和
-错误。需要恢复中间件诊断时可显式执行：
-
-```bash
-export GRASPV2_FASTDDS_LOG_LEVEL=warning  # 或 info/default
-```
-
-仿真和真机直接使用 Ultra 的 14 个物理臂轴，不再进行 10 轴到 14 槽的补零映射。上半身
-消息构造器也支持 `hand_sub_mode=1` 的 `[左, 右]` OmniPicker
-开合量，当前独立夹爪 CLI 仍走更容易单独验证反馈的 HAL hand 接口。
-
-真机发布仍必须显式增加两个确认参数：
-
-```bash
-ros2 run graspv2 x2_aimdk_hardware trajectory \
-  --trajectory output/planned_trajectory.json \
-  --transport upper-body \
-  --execute --confirm-control-authority
-```
-
-旧测试机固件如果没有 `SetMcAction` 或 `/mc/upper_body_command` 订阅者，preflight/执行会明确
-失败，不会静默退到 HAL。当前 v0.9 的 MC animation 播放链路保持不变，可继续使用
-`run.sh --mode animation`。
-
-### HAL 关节后备与 OmniPicker
-
-低层双臂后备可显式选择 `--transport hal-joint`；OmniPicker 独立命令走 hand HAL：
-
-```bash
-ros2 run graspv2 x2_aimdk_hardware preflight \
-  --component upper-body --transport hal-joint
-
-ros2 run graspv2 x2_aimdk_hardware trajectory \
-  --trajectory output/planned_trajectory.json \
-  --transport hal-joint
-
-ros2 run graspv2 x2_aimdk_hardware omnipicker \
-  --action close
-```
-
-实际发布必须显式增加 `--execute --confirm-control-authority`。对于比赛 OmniPicker，这个
-确认表示遵守赛项已经配置好的机器人模式和夹爪链路，不自行停止/重启 MC，不修改手型、
-设备 ID、CAN/EtherCAT 或固件，并已确认现场安全。对于 `hal-joint` 低层上肢后备，则还
-表示现场已经完成以下工作：
-
-1. 根据实际固件和系统集成方案处理原生 MC 的控制权；
-2. 吊架或固定底座、实体急停和人员隔离均就绪；
-3. MC 停止后仍有人/上层控制器负责所有维持机器人安全所需的关节；
-4. 轨迹起点与实时反馈误差在配置阈值内。
-
-比赛参考明确规定 OmniPicker 的机器人模式和设备参数已由工作人员配置，参赛程序不得
-自行停止或重启 MC。`hal-joint` 则属于另一条低层上肢后备：全身站立机器人若没有其他
-控制器接管腿和躯干会失去平衡。graspV2 不会自动停止 MC，也不会把命令失败后的自动重试
-当成安全恢复。
-
-### 视觉闭环抓取路径
-
-`run_full_grasp_pipeline.sh` 现在生成两条独立验证轨迹：接近轨迹，以及从抓取点沿桌面法向
-抬升的轨迹。抬升默认 `0.10 m`，运动时间严格为 `2.0 s`。真机入口在一次持续的
-`UPPERBODY_REMOTE_SPLIT` 会话内执行：
-
-1. 打开右侧 OmniPicker；
-2. 走碰撞验证的预抓取/笛卡尔接近轨迹；
-3. 闭合夹爪，同时继续以 50 Hz 发布上肢保持帧；
-4. 重新采集 RGB-D，要求同类目标仍位于计划抓取区；
-5. 执行两秒抬升轨迹；
-6. 再次采集 RGB-D，要求目标沿抬升方向移动至少默认高度的 60%，同时满足目标位置误差和
-   横向漂移门限；仍停在桌面上的目标会判为抓取失败；
-7. 成功或视觉判定失败时，均沿已验证轨迹下降、松爪并逆向撤回，再恢复稳定站立模式。
-
-视觉采集/推理在线程中运行，控制线程在两个检查点持续发布末端保持帧，而不是在推理期间
-停止控制。每次执行写入 `output/grasp_status.json`，包含两次视觉检查的坐标、误差和最终
-`success`。视觉超时、目标消失、类别变化、抬升位移不足或漂移过大都会返回失败。
-
-离线检查与真机执行示例：
-
-```bash
-# 规划、碰撞检查和状态机契约检查；不采集检查点、不连接机器人
-./run_full_grasp_pipeline.sh --target-class "orange-capped pill bottle" \
-  --use-existing-vision
-
-# 真机；仍需现场标定确认并输入 RUN
-# 执行入口强制重新采集 RGB-D；--use-existing-vision/现有文件后端仅限离线检查
-./run_full_grasp_pipeline.sh --target-class "orange-capped pill bottle" \
-  --camera-calibration /path/to/x2_camera_calibration.json \
-  --execute --confirm-calibrated
-```
-
-当前视觉仍提供 3D 表面点而非完整 6D 抓取姿态，因此夹爪方向继续由现有 IK/工具标定定义；
-透明、反光或被夹爪完全遮挡的物体可能无法通过视觉门限，程序会安全判失败，不会把“未看见”
-当作已经抓牢。旧的 hand-free MC animation 入口仍保留用于单独轨迹回放，但不再是完整抓取
-流水线的执行后端。
-
-OmniPicker 发布示例仅用于完成上述现场安全准备之后：
-
-```bash
-ros2 run graspv2 x2_aimdk_hardware omnipicker \
-  --action close \
-  --execute --confirm-control-authority
-```
-
-Python 集成层位于 `graspv2.hardware_contract` 与 `graspv2.aimdk_hardware`：
-
-- `UpperBodyControl.command_joint_group()` 暴露 `arm`、`waist`、`head` 三组端口；
-- `UpperBodyControl.command_upper_body()` 暴露 MC 分控的头/双臂/手统一帧；
-- `OmniPickerControl.command_omnipicker()` 使用归一化 `0.0～1.0` 行程；
-- `create_aimdk_hardware_node()` 是唯一绑定 `rclpy`/`aimdk_msgs` 的适配器工厂。
-
-项目当前只有 `ultra` profile。`--robot ultra` 和 `--side right` 仅作为旧命令兼容参数保留；
-其他机型或左侧夹爪参数会在命令行解析阶段被拒绝。
+- `graspv2.hardware_contract`：ROS 无关的 topic、服务、消息布局和控制参数；
+- `graspv2.aimdk_hardware`：唯一绑定 `rclpy/aimdk_msgs` 的真机控制适配器；
+- `vision/ros_rgbd_capture.py`：X2 ROS RGB-D 订阅、同步、配准和落盘；
+- `tools/orbbec_capture.cpp`：测试机本地 Orbbec SDK 采集器；
+- `graspv2.mc_custom_grasp`：MC animation 前检和 `SetMcPresetMotion` 客户端。

@@ -98,12 +98,31 @@ fi
 
 export GRASPV2_AIMDK_SETUP="$aimdk_setup"
 "$repo_dir/tools/build_graspv2_with_installed_aimdk.sh"
+"$repo_dir/tools/build_orbbec_capture.sh" --if-available
 
 cupti_lib="$repo_dir/.vision-venv/lib/python3.10/site-packages/nvidia/cuda_cupti/lib"
 export LD_LIBRARY_PATH="$repo_dir/.runtime/cusparselt/lib:$cupti_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 "$repo_dir/.planning-venv/bin/python" - <<'PY'
-import mujoco, numpy, pinocchio, x2_ik_sdk
-print(f"planning: numpy={numpy.__version__}, mujoco={mujoco.__version__}, pinocchio={pinocchio.__version__}")
+import platform
+
+import mujoco
+import numpy
+import pinocchio
+import x2_ik_sdk
+
+# This deliberately creates no renderer or OpenGL context.  It proves that the
+# bundled ARM64 native library can compile and evaluate a model on the Orin
+# before any vision capture or robot command is attempted.
+model = mujoco.MjModel.from_xml_string(
+    '<mujoco><worldbody><body><joint type="hinge"/><geom type="sphere" size="0.01"/></body></worldbody></mujoco>'
+)
+data = mujoco.MjData(model)
+mujoco.mj_forward(model, data)
+print(
+    f"planning: arch={platform.machine()}, numpy={numpy.__version__}, "
+    f"mujoco={mujoco.__version__}, pinocchio={pinocchio.__version__}, "
+    "headless_model_check=PASS"
+)
 PY
 "$repo_dir/.vision-venv/bin/python" - <<'PY'
 import cv2, ftfy, numpy, regex, torch, torchvision, ultralytics

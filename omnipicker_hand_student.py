@@ -38,6 +38,10 @@ _REEXEC_FLAG = "_OMNIPICKER_STUDENT_REEXEC"
 
 def load_ros_environment():
     """尝试加载机器人上的 ROS 2 与 AimDK 环境。此函数无需修改。"""
+    # graspV2 embeds this SDK after selecting the firmware-matched overlay.
+    # Keep that environment intact instead of sourcing a second AimDK copy.
+    if os.environ.get("GRASPV2_X2_ENV_READY") == "1":
+        return
     setup_files = sorted(glob.glob("/opt/ros/*/setup.bash"))
     aimdk_setup = os.path.expanduser("~/aimdk/install/setup.bash")
 
@@ -160,13 +164,19 @@ class OmniPickerStudentNode(Node):
             command_qos,
         )
 
-    def publish_command(self, hand, target_position):
+    def publish_command(
+        self,
+        hand,
+        target_position,
+        duration_seconds=PUBLISH_DURATION_SECONDS,
+    ):
         """在规定时间内持续发布目标夹爪命令。
 
         TODO 3：
           1. 调用 build_hand_message() 生成消息；
           2. 按 PUBLISH_FREQUENCY_HZ 持续发布；
-          3. 发布时长使用 PUBLISH_DURATION_SECONDS；
+          3. 发布时长使用 duration_seconds（默认
+             PUBLISH_DURATION_SECONDS）；
           4. 循环期间保持 ROS 2 节点正常处理事件；
           5. 结束后输出实际发布帧数。
 
@@ -175,7 +185,10 @@ class OmniPickerStudentNode(Node):
         message = build_hand_message(hand, target_position)
         period_seconds = 1.0 / PUBLISH_FREQUENCY_HZ
         started_at = time.monotonic()
-        deadline = started_at + PUBLISH_DURATION_SECONDS
+        duration_seconds = float(duration_seconds)
+        if duration_seconds <= 0.0:
+            raise ValueError("发布时长必须为正数")
+        deadline = started_at + duration_seconds
         next_publish_at = started_at
         published_frames = 0
 
@@ -241,12 +254,20 @@ def parse_arguments():
         metavar="POSITION",
         help="position 动作的目标开度，范围 0.0～1.0",
     )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=PUBLISH_DURATION_SECONDS,
+        help="持续发布秒数（默认 2.0；GraspV2 用它匹配规划阶段时长）",
+    )
     args = parser.parse_args()
 
     if args.action == "position" and args.target_position is None:
         parser.error("position 动作必须提供 0.0～1.0 的 POSITION")
     if args.action != "position" and args.target_position is not None:
         parser.error("只有 position 动作可以提供 POSITION")
+    if args.duration <= 0.0:
+        parser.error("--duration 必须为正数")
     return args
 
 
@@ -269,7 +290,11 @@ def main():
     rclpy.init()
     node = OmniPickerStudentNode()
     try:
-        node.publish_command(args.hand, target_position)
+        node.publish_command(
+            args.hand,
+            target_position,
+            duration_seconds=args.duration,
+        )
     except NotImplementedError as exc:
         print("任务尚未完成：", exc)
         print("请根据配套说明和官方 AimDK 示例补全所有 TODO。")

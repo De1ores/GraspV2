@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Estimate one YOLOE grasp point and the table plane in MuJoCo world coordinates."""
+"""Estimate YOLOE object/gripper centers and the table plane in MuJoCo coordinates."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import platform
 import sys
@@ -23,12 +24,20 @@ THIRD_PARTY.append(ROOT / "third_party/ultralytics_clip")
 for directory in reversed(THIRD_PARTY):
     if directory.exists():
         sys.path.insert(0, str(directory))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/graspv2-matplotlib")
 
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from ultralytics import YOLO  # noqa: E402
+
+from graspv2.vision_geometry import (  # noqa: E402
+    DEFAULT_SIDE_GRASP_HEIGHT_OFFSET_M,
+    estimate_object_and_gripper_centers,
+)
+from vision.rgbd_orientation import resolve_camera_transform  # noqa: E402
 
 
 DEFAULT_CLASSES = [
@@ -38,6 +47,11 @@ DEFAULT_CLASSES = [
 ]
 
 MINIMUM_OBJECT_DEPTH_PIXELS = 30
+TABLE_DETECTION_EXIT_CODE = 42
+
+
+class TableDetectionError(RuntimeError):
+    """Raised only when the captured depth cannot produce a valid tabletop."""
 
 
 def parse_args() -> argparse.Namespace:
@@ -758,7 +772,18 @@ def evaluate_detection_candidate(
     minimum_height_m = float(settings.get("minimum_height_above_table_m", 0.01))
     image_margin_px = float(settings.get("table_polygon_margin_px", 0.0))
     footprint_margin_m = float(settings.get("table_footprint_margin_m", 0.0))
-    if minimum_height_m < 0.0 or image_margin_px < 0.0 or footprint_margin_m < 0.0:
+    footprint_tolerance_m = float(
+        settings.get("table_footprint_tolerance_m", 0.0)
+    )
+    if any(
+        value < 0.0
+        for value in (
+            minimum_height_m,
+            image_margin_px,
+            footprint_margin_m,
+            footprint_tolerance_m,
+        )
+    ):
         raise ValueError("candidate_filter thresholds must be non-negative")
 
     report: dict[str, Any] = {
@@ -768,6 +793,7 @@ def evaluate_detection_candidate(
             "minimum_height_above_table_m": minimum_height_m,
             "table_polygon_margin_px": image_margin_px,
             "table_footprint_margin_m": footprint_margin_m,
+            "table_footprint_tolerance_m": footprint_tolerance_m,
         },
     }
     if instance_mask is None:
@@ -827,13 +853,19 @@ def evaluate_detection_candidate(
         np.asarray(table_result["visible_extent"]["size_xy_m"], dtype=np.float64)
         / 2.0
     )
-    allowed_half_size_xy = half_size_xy - footprint_margin_m
+    allowed_half_size_xy = (
+        half_size_xy - footprint_margin_m + footprint_tolerance_m
+    )
     if np.any(allowed_half_size_xy <= 0.0):
         raise ValueError(
             "candidate_filter.table_footprint_margin_m leaves no usable table area"
         )
     footprint_inside = bool(
         np.all(np.abs(local_surface[:2]) <= allowed_half_size_xy)
+    )
+    footprint_overflow_xy = np.maximum(
+        np.abs(local_surface[:2]) - half_size_xy,
+        0.0,
     )
     above_table = height_above_table_m >= minimum_height_m
     report.update(
@@ -842,6 +874,8 @@ def evaluate_detection_candidate(
             "surface_point_mujoco_m": as_list(surface_mujoco),
             "height_above_table_m": round(height_above_table_m, 6),
             "surface_projection_table_local_xy_m": as_list(local_surface[:2]),
+            "table_footprint_half_size_xy_m": as_list(half_size_xy),
+            "surface_projection_overflow_xy_m": as_list(footprint_overflow_xy),
             "surface_projection_inside_table_footprint": footprint_inside,
             "surface_above_table": above_table,
         }
@@ -936,9 +970,9 @@ def main() -> None:
 
     calibration_path = args.calibration.resolve()
     calibration = read_json(calibration_path)
-    matrix = np.asarray(calibration["T_mujoco_camera_nominal"], dtype=np.float64)
-    if matrix.shape != (4, 4):
-        raise ValueError("T_mujoco_camera_nominal must be 4x4")
+    nominal_matrix, matrix, rotation_adjustment = resolve_camera_transform(
+        calibration, camera
+    )
     configured_offset = np.asarray(calibration["point_offset_mujoco_m"], dtype=np.float64)
     if configured_offset.shape != (3,):
         raise ValueError("point_offset_mujoco_m must contain exactly three values")
@@ -968,15 +1002,21 @@ def main() -> None:
             else instance_mask
         )
         excluded_table_mask |= exclusion > 0
-    table_result, table_inlier_uv, table_corners_mujoco = estimate_table_plane(
-        depth_raw,
-        camera,
-        excluded_table_mask,
-        matrix,
-        point_offset,
-        calibration["table_detection"],
-        anchor_uv=None,
-    )
+    try:
+        table_result, table_inlier_uv, table_corners_mujoco = estimate_table_plane(
+            depth_raw,
+            camera,
+            excluded_table_mask,
+            matrix,
+            point_offset,
+            calibration["table_detection"],
+            anchor_uv=None,
+        )
+    except RuntimeError as error:
+        # Keep this boundary narrow: model loading, target selection, malformed
+        # calibration and object-depth failures must never cause an orientation
+        # retry.  The shell entrypoint rotates only for this dedicated status.
+        raise TableDetectionError(str(error)) from error
     projected_corners = project_mujoco_points_to_image(
         table_corners_mujoco, matrix, point_offset, camera
     )
@@ -1013,6 +1053,21 @@ def main() -> None:
     raw_valid_pixel_count = int(selected_depth["raw_valid_pixel_count"])
     valid_depth_fraction = float(selected_depth["valid_depth_fraction"])
     median_depth = float(selected_depth["median_depth_m"])
+    color_intrinsics = camera["color"]["intrinsics"]
+    focal_length_px = math.sqrt(
+        float(color_intrinsics["fx"]) * float(color_intrinsics["fy"])
+    )
+    equivalent_radius_px = math.sqrt(
+        float(np.count_nonzero(selected_mask)) / math.pi
+    )
+    selected["mask_equivalent_radius_px"] = round(equivalent_radius_px, 3)
+    selected["visual_radius_m"] = round(
+        equivalent_radius_px * median_depth / focal_length_px,
+        6,
+    )
+    selected["visual_radius_method"] = (
+        "segmentation_mask_equivalent_area_at_median_depth"
+    )
     mad = float(selected_depth["mad_m"])
     depth_p05 = float(selected_depth["depth_p05_m"])
     depth_p95 = float(selected_depth["depth_p95_m"])
@@ -1033,26 +1088,84 @@ def main() -> None:
     pregrasp_camera = surface_point + args.pregrasp_offset_m * normal_camera
     surface_mujoco = transform_point(matrix, surface_point) + point_offset
     centroid_mujoco = transform_point(matrix, cloud_centroid) + point_offset
+    points_mujoco = (
+        (matrix[:3, :3] @ points_camera.T).T
+        + matrix[:3, 3]
+        + point_offset
+    )
+    center_ray_camera, _ = pixels_to_rays(
+        mask_center_uv.reshape(1, 2),
+        camera["color"]["intrinsics"],
+        camera["color"]["distortion"],
+    )
+    center_ray_mujoco = matrix[:3, :3] @ center_ray_camera[0]
+    plane = table_result["plane_equation"]
+    grasp_geometry = calibration.get("grasp_geometry", {})
+    center_estimate = estimate_object_and_gripper_centers(
+        points_mujoco,
+        matrix[:3, 3] + point_offset,
+        center_ray_mujoco,
+        plane["normal_mujoco"],
+        float(plane["d_m"]),
+        gripper_height_offset_m=float(
+            grasp_geometry.get(
+                "side_grasp_height_offset_m",
+                DEFAULT_SIDE_GRASP_HEIGHT_OFFSET_M,
+            )
+        ),
+    )
+    object_center_mujoco = np.asarray(
+        center_estimate.object_center_world_m, dtype=np.float64
+    )
+    gripper_center_mujoco = np.asarray(
+        center_estimate.gripper_center_world_m, dtype=np.float64
+    )
     normal_mujoco = transform_vector(matrix, normal_camera)
     pregrasp_mujoco = transform_point(matrix, pregrasp_camera) + point_offset
+    selected["estimated_object_height_m"] = round(
+        center_estimate.object_height_m, 6
+    )
     mujoco_result = {
         "coordinate_frame": calibration["coordinate_system"]["name"],
         "axes": calibration["coordinate_system"]["axes"],
         "reference_pose": calibration["reference_pose"],
         "calibration_source": str(calibration_path),
-        "T_mujoco_camera_nominal": matrix.tolist(),
+        "T_mujoco_camera_nominal": nominal_matrix.tolist(),
+        "T_mujoco_camera_effective": matrix.tolist(),
+        "image_rotation_adjustment": rotation_adjustment,
         "point_offset_mujoco_m_applied": as_list(point_offset),
         "point_offset_source": "command_line" if args.offset_mujoco_m is not None else "calibration_file",
         "surface_point_mujoco_m": as_list(surface_mujoco),
         "visible_cloud_centroid_mujoco_m": as_list(centroid_mujoco),
+        "object_center_mujoco_m": as_list(object_center_mujoco),
+        "gripper_center_mujoco_m": as_list(gripper_center_mujoco),
+        "center_estimation": {
+            "method": center_estimate.method,
+            "object_height_m": round(center_estimate.object_height_m, 6),
+            "visible_height_percentiles_m": [
+                round(value, 6)
+                for value in center_estimate.visible_height_percentiles_m
+            ],
+            "side_grasp_height_offset_m": round(
+                float(
+                    grasp_geometry.get(
+                        "side_grasp_height_offset_m",
+                        DEFAULT_SIDE_GRASP_HEIGHT_OFFSET_M,
+                    )
+                ),
+                6,
+            ),
+        },
         "local_pca_normal_mujoco_experimental": as_list(normal_mujoco),
-        "pregrasp_point_mujoco_m_experimental": as_list(pregrasp_mujoco),
+        "surface_normal_offset_point_mujoco_m_experimental": as_list(pregrasp_mujoco),
         "warning": calibration["warning"],
     }
 
     output = {
-        "schema_version": 1,
-        "grasp_point_mujoco_m": as_list(surface_mujoco),
+        "schema_version": 2,
+        "surface_point_mujoco_m": as_list(surface_mujoco),
+        "object_center_mujoco_m": as_list(object_center_mujoco),
+        "gripper_center_mujoco_m": as_list(gripper_center_mujoco),
         "table_plane_mujoco": table_result,
         "source": {
             "frame_dir": str(frame_dir),
@@ -1060,6 +1173,9 @@ def main() -> None:
             "depth": str(depth_path),
             "camera_metadata": str(metadata_path),
             "camera_serial_number": camera["device"]["serial_number"],
+            "image_orientation": camera.get(
+                "image_orientation", {"rotation_deg": 0, "selection_mode": "legacy"}
+            ),
         },
         "inference": {
             "weights": str(args.weights.resolve()),
@@ -1113,12 +1229,12 @@ def main() -> None:
             "visible_cloud_centroid_camera_m": as_list(cloud_centroid),
             "local_pca_normal_camera_experimental": as_list(normal_camera),
             "pregrasp_offset_m": args.pregrasp_offset_m,
-            "pregrasp_point_camera_m_experimental": as_list(pregrasp_camera),
+            "surface_normal_offset_point_camera_m_experimental": as_list(pregrasp_camera),
             "normal_fit_point_count": normal_point_count,
             "normal_fit_eigenvalues": as_list(normal_eigenvalues, 10),
         },
         "mujoco": mujoco_result,
-        "status": "visual_debug_3d_point_only_not_an_executable_6d_grasp_pose",
+        "status": "estimated_object_and_gripper_centers_for_side_grasp",
     }
     output_path = output_dir / "result.json"
     output_path.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1170,6 +1286,48 @@ def main() -> None:
     cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 220, 255), 2)
     center_xy = tuple(np.rint(surface_uv).astype(int))
     cv2.drawMarker(annotated, center_xy, (0, 0, 255), cv2.MARKER_CROSS, 28, 3)
+    center_pixels = project_mujoco_points_to_image(
+        np.vstack((object_center_mujoco, gripper_center_mujoco)),
+        matrix,
+        point_offset,
+        camera,
+    )
+    object_center_xy = tuple(np.rint(center_pixels[0]).astype(int))
+    gripper_center_xy = tuple(np.rint(center_pixels[1]).astype(int))
+    cv2.drawMarker(
+        annotated,
+        object_center_xy,
+        (255, 120, 0),
+        cv2.MARKER_DIAMOND,
+        24,
+        2,
+    )
+    cv2.drawMarker(
+        annotated,
+        gripper_center_xy,
+        (255, 0, 255),
+        cv2.MARKER_TILTED_CROSS,
+        24,
+        2,
+    )
+    cv2.putText(
+        annotated,
+        "object center",
+        (object_center_xy[0] + 8, object_center_xy[1] + 18),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (255, 120, 0),
+        1,
+    )
+    cv2.putText(
+        annotated,
+        "gripper center",
+        (gripper_center_xy[0] + 8, gripper_center_xy[1] - 8),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (255, 0, 255),
+        1,
+    )
     label = f"{selected['class_name']} {selected['confidence']:.2f} z={surface_point[2]:.3f}m"
     cv2.putText(annotated, label, (max(5, x1), max(25, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 255), 2)
     xyz_text = f"cam xyz=({surface_point[0]:+.3f}, {surface_point[1]:+.3f}, {surface_point[2]:+.3f})m"
@@ -1194,7 +1352,9 @@ def main() -> None:
         print("Depth quality warnings:")
         for warning in quality_warnings:
             print(f"  - {warning}")
-    print(f"MuJoCo world xyz [m]: {as_list(surface_mujoco)}")
+    print(f"MuJoCo surface point [m]: {as_list(surface_mujoco)}")
+    print(f"MuJoCo object center [m]: {as_list(object_center_mujoco)}")
+    print(f"MuJoCo gripper center [m]: {as_list(gripper_center_mujoco)}")
     print(f"MuJoCo point offset [m]: {as_list(point_offset)}")
     print(f"Table center MuJoCo [m]: {table_result['center_mujoco_m']}")
     print(f"Table normal MuJoCo: {table_result['plane_equation']['normal_mujoco']}")
@@ -1204,4 +1364,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except TableDetectionError as error:
+        print(f"Table detection failed: {error}", file=sys.stderr)
+        raise SystemExit(TABLE_DETECTION_EXIT_CODE) from None
