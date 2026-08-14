@@ -59,12 +59,14 @@ Options:
   --table-clearance METERS  Required table clearance (default: 0.025).
   --lift-height METERS      Lift distance along the table normal (default: 0.045).
   --lift-duration SEC       Lift motion duration (default: 2.5).
-  --capture-backend MODE    auto (default), x2-aimdk, orbbec-sdk, or existing.
+  --capture-backend MODE    auto (default), x2-aimdk, x2-remote, orbbec-sdk,
+                            or existing. x2-remote uses GRASPV2_ROBOT_HOST.
                             auto uses X2 topics and falls back to the local SDK
                             only when the topic set times out.
                             existing consumes a manually captured RGB-D frame.
   --verification-capture-backend MODE
-                            Fresh checkpoint capture: auto, x2-aimdk or orbbec-sdk.
+                            Fresh checkpoint capture: auto, x2-aimdk,
+                            x2-remote or orbbec-sdk.
                             Defaults to the capture backend, or auto when
                             the initial input uses existing files.
   --camera-calibration PATH Camera-to-MuJoCo calibration for the selected sensor.
@@ -151,8 +153,8 @@ case "$robot" in
   *) echo "--robot only supports ultra" >&2; exit 2 ;;
 esac
 case "$capture_backend" in
-  auto|x2-aimdk|orbbec-sdk|existing) ;;
-  *) echo "--capture-backend must be auto, x2-aimdk, orbbec-sdk, or existing" >&2; exit 2 ;;
+  auto|x2-aimdk|x2-remote|orbbec-sdk|existing) ;;
+  *) echo "--capture-backend must be auto, x2-aimdk, x2-remote, orbbec-sdk, or existing" >&2; exit 2 ;;
 esac
 case "$image_rotation_deg" in
   calibrated|auto|0|180) ;;
@@ -166,8 +168,8 @@ if [[ -z "$verification_capture_backend" ]]; then
   fi
 fi
 case "$verification_capture_backend" in
-  auto|x2-aimdk|orbbec-sdk) ;;
-  *) echo "--verification-capture-backend must be auto, x2-aimdk or orbbec-sdk" >&2; exit 2 ;;
+  auto|x2-aimdk|x2-remote|orbbec-sdk) ;;
+  *) echo "--verification-capture-backend must be auto, x2-aimdk, x2-remote or orbbec-sdk" >&2; exit 2 ;;
 esac
 if [[ "$execute" == true && "$confirm_calibrated" != true ]]; then
   echo "Execution blocked: add --confirm-calibrated only after checking camera-to-robot calibration." >&2

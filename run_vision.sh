@@ -22,6 +22,7 @@ fi
 capture_backend="existing"
 capture_only=false
 output_dir="$repo_dir/output"
+robot_host="${GRASPV2_ROBOT_HOST:-${GRASPV2_ROBOT_ADDRESS:-}}"
 orbbec_binary="${GRASPV2_ORBBEC_CAPTURE:-$repo_dir/build/orbbec_capture}"
 ros_capture_python="${GRASPV2_ROS_CAPTURE_PYTHON:-/usr/bin/python3}"
 capture_timeout="20"
@@ -38,11 +39,13 @@ vision_args=()
 
 usage() {
   cat <<'EOF'
-Usage: ./run_vision.sh --capture-backend auto|x2-aimdk|orbbec-sdk|existing [options] [YOLOE options]
+Usage: ./run_vision.sh --capture-backend auto|x2-aimdk|x2-remote|orbbec-sdk|existing [options] [YOLOE options]
 
 Capture backends:
   auto         Try X2 topics, then use the local Orbbec SDK only on timeout.
-  x2-aimdk    Subscribe to the official X2 RGB/depth Image and CameraInfo topics.
+  x2-aimdk     Subscribe to the official X2 RGB/depth Image and CameraInfo topics.
+  x2-remote    Run the same subscriber on agi@<robot-host> and copy one frame
+              back for local inference.
   orbbec-sdk  Invoke the existing manual Orbbec SDK capture binary.
   existing    Do not capture; consume output/color.png, depth.png and camera.json.
 
@@ -50,6 +53,7 @@ Capture options:
   --capture-only                 Stop after writing the RGB-D frame contract.
   --output-dir DIR               Frame directory (default: output).
   --hardware-config PATH         AimDK topic/tuning config.
+  --robot-host IP                X2 Orin used by x2-remote (user defaults to agi).
   --color-topic TOPIC            Override X2 RGB Image topic.
   --depth-topic TOPIC            Override X2 depth Image topic.
   --rgb-camera-info-topic TOPIC  Override X2 RGB CameraInfo topic.
@@ -70,12 +74,13 @@ EOF
 
 while (($#)); do
   case "$1" in
-    --capture-backend|--output-dir|--hardware-config|--color-topic|--depth-topic|--rgb-camera-info-topic|--depth-camera-info-topic|--capture-timeout|--warmup-frames|--depth-scale-m|--image-rotation-deg|--calibration|--orbbec-binary)
+    --capture-backend|--output-dir|--hardware-config|--robot-host|--color-topic|--depth-topic|--rgb-camera-info-topic|--depth-camera-info-topic|--capture-timeout|--warmup-frames|--depth-scale-m|--image-rotation-deg|--calibration|--orbbec-binary)
       (($# >= 2)) || { echo "$1 requires a value" >&2; exit 2; }
       case "$1" in
         --capture-backend) capture_backend="$2" ;;
         --output-dir) output_dir="$2" ;;
         --hardware-config) hardware_config="$2" ;;
+        --robot-host) robot_host="$2" ;;
         --color-topic) color_topic="$2" ;;
         --depth-topic) depth_topic="$2" ;;
         --rgb-camera-info-topic) rgb_info_topic="$2" ;;
@@ -105,8 +110,8 @@ while (($#)); do
 done
 
 case "$capture_backend" in
-  auto|x2-aimdk|orbbec-sdk|existing) ;;
-  *) echo "--capture-backend must be auto, x2-aimdk, orbbec-sdk, or existing" >&2; exit 2 ;;
+  auto|x2-aimdk|x2-remote|orbbec-sdk|existing) ;;
+  *) echo "--capture-backend must be auto, x2-aimdk, x2-remote, orbbec-sdk, or existing" >&2; exit 2 ;;
 esac
 case "$image_rotation_deg" in
   calibrated|auto|0|180) ;;
@@ -147,6 +152,26 @@ capture_x2_aimdk() {
     "$ros_capture_python" "$repo_dir/vision/ros_rgbd_capture.py" "${capture_args[@]}"
 }
 
+capture_x2_remote() {
+    if [[ -z "$robot_host" ]]; then
+      echo "x2-remote requires --robot-host or GRASPV2_ROBOT_HOST" >&2
+      return 2
+    fi
+    local capture_args=(
+      --robot-host "$robot_host"
+      --output-dir "$output_dir"
+      --timeout "$capture_timeout"
+      --warmup-frames "$warmup_frames"
+      --depth-scale-m "$depth_scale_m"
+      --image-rotation-deg "$preferred_rotation_deg"
+    )
+    [[ -z "$color_topic" ]] || capture_args+=(--color-topic "$color_topic")
+    [[ -z "$depth_topic" ]] || capture_args+=(--depth-topic "$depth_topic")
+    [[ -z "$rgb_info_topic" ]] || capture_args+=(--camera-info-topic "$rgb_info_topic")
+    [[ -z "$depth_info_topic" ]] || capture_args+=(--depth-camera-info-topic "$depth_info_topic")
+    "$repo_dir/tools/remote_capture.sh" "${capture_args[@]}"
+}
+
 capture_orbbec_sdk() {
     if [[ ! -x "$orbbec_binary" ]]; then
       "$repo_dir/tools/build_orbbec_capture.sh" --if-available
@@ -178,6 +203,10 @@ case "$capture_backend" in
     ;;
   x2-aimdk)
     capture_x2_aimdk
+    ;;
+  x2-remote)
+    capture_x2_remote
+    echo "RGB-D source selected: remote X2 AimDK topics on $robot_host"
     ;;
   orbbec-sdk)
     capture_orbbec_sdk

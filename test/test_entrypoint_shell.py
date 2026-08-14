@@ -144,3 +144,36 @@ def test_runtime_profile_can_be_pinned_without_host_probing() -> None:
         )
         assert completed.returncode == 0
         assert completed.stdout == expected + "\n"
+
+
+def test_split_pipeline_help_does_not_contact_robot() -> None:
+    completed = _run_help("run_split_grasp_pipeline.sh")
+
+    assert completed.returncode == 0
+    assert completed.stdout.startswith("Usage:")
+    assert "atomic MC animation" in completed.stdout
+    assert completed.stderr == ""
+
+
+def test_split_installers_expose_non_mutating_help() -> None:
+    for script in (
+        "tools/install_local_split.sh",
+        "tools/deploy_robot_edge.sh",
+        "tools/remote_capture.sh",
+        "tools/remote_execute.sh",
+    ):
+        completed = _run_help(script)
+        assert completed.returncode == 0, (script, completed.stderr)
+        assert completed.stdout.startswith("Usage:"), script
+
+
+def test_remote_edge_bundle_excludes_heavy_compute_assets() -> None:
+    deployer = (ROOT / "tools" / "deploy_robot_edge.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "vision/ros_rgbd_capture.py" in deployer
+    assert "remote/execute_bundle.py" in deployer
+    assert "yoloe_depth_target.py" not in deployer
+    assert "x2_ik_sdk" not in deployer
+    assert "yoloe-26s-seg.pt" not in deployer

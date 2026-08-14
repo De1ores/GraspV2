@@ -1930,7 +1930,7 @@ def _parser() -> argparse.ArgumentParser:
     grasp.add_argument("--target-class", required=True)
     grasp.add_argument(
         "--capture-backend",
-        choices=("auto", "x2-aimdk", "orbbec-sdk"),
+        choices=("auto", "x2-aimdk", "x2-remote", "orbbec-sdk"),
         default="auto",
     )
     grasp.add_argument("--camera-calibration", type=Path)

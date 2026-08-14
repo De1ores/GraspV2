@@ -7,6 +7,9 @@
 完整安装、打包、运行和故障排查统一见
 [`docs/package_install_run_debug_zh.md`](docs/package_install_run_debug_zh.md)。本页只保留常用入口。
 
+若希望只把 RGB-D 采集和最终动作放在机器人 Orin、其余计算留在本地工作站，使用
+[`docs/split_local_robot_deployment_zh.md`](docs/split_local_robot_deployment_zh.md) 的轻量拆分部署。
+
 ## 快速开始
 
 开发机无头仿真，不连接机器人：
@@ -57,6 +60,7 @@ source tools/setup_x2_mc_env.sh
 | `run_vision.sh` | RGB-D 采集和 YOLOE 识别 | 只读相机 |
 | `run_full_grasp_pipeline.sh --plan-only` | 采集、识别和三段规划 | 不发布控制命令 |
 | `run_full_grasp_pipeline.sh --execute` | 视觉闭环抓取 | 是，需双重确认 |
+| `run_split_grasp_pipeline.sh` | 远程采集、本地计算、远程原子执行 | 仅加 `--execute` 后 |
 
 真机前必须依次通过：环境导入、RGB-D、无头规划、AimDK 只读前检和 `--plan-only`。不要通过
 放宽碰撞、起点或跟踪门限来绕过失败。
@@ -99,6 +103,10 @@ topic 在超时前无法同步时，自动改用同一相机的本地 Orbbec SDK
 
 # X2 官方 topic
 ./run_vision.sh --capture-backend x2-aimdk --capture-only
+
+# 在机器人 Orin 订阅 X2 topic，再复制到本地
+./run_vision.sh --capture-backend x2-remote \
+  --robot-host 10.0.200.40 --capture-only
 
 # 测试机显式调用本地 Orbbec SDK 二进制
 ./run_vision.sh --capture-backend orbbec-sdk --capture-only
@@ -221,6 +229,7 @@ animation：移动前全开 3 秒、安全预备/下降、按目标半径闭合�
 ## 文档
 
 - [安装、打包、运行与故障排查](docs/package_install_run_debug_zh.md)
+- [本地计算 / X2 Orin 轻量拆分部署](docs/split_local_robot_deployment_zh.md)
 - [比赛真机环境与 Motion 接口](docs/competition_robot_environment_motion_zh.md)
 - [X2 topic、消息和控制契约](docs/x2_hardware_interfaces_zh.md)
 - [TCP 与工具偏移标定](docs/tool_offset_calibration_zh.md)
