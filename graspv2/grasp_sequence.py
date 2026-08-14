@@ -13,6 +13,9 @@ import numpy as np
 from .trajectory import JointTrajectory, TrajectoryValidationError
 
 
+MINIMUM_PREMOTION_OPEN_DURATION_S = 3.0
+
+
 class VisualVerificationError(RuntimeError):
     """Raised when vision cannot prove that the object followed the gripper."""
 
@@ -309,6 +312,15 @@ def load_grasp_plan_metadata(
         raise TrajectoryValidationError(
             "approach trajectory has no verified grasp sequence metadata"
         )
+    if approach_planning.get("gripper_fully_open_before_arm_motion") is not True:
+        raise TrajectoryValidationError(
+            "approach trajectory was not collision-checked with the gripper "
+            "fully open before arm motion"
+        )
+    if sequence.get("gripper_fully_open_before_arm_motion") is not True:
+        raise TrajectoryValidationError(
+            "grasp sequence does not open the gripper before arm motion"
+        )
 
     def sequence_number(name: str, *, positive: bool = True) -> float:
         value = sequence.get(name)
@@ -357,6 +369,11 @@ def load_grasp_plan_metadata(
             "reclose_duration_s",
         )
     }
+    if phase_durations["open_duration_s"] < MINIMUM_PREMOTION_OPEN_DURATION_S:
+        raise TrajectoryValidationError(
+            "pre-motion gripper-open duration is shorter than "
+            f"{MINIMUM_PREMOTION_OPEN_DURATION_S:.1f} s"
+        )
     return_mode = return_planning.get("return_mode")
     if return_mode != "controlled_lower_then_reverse_approach":
         raise TrajectoryValidationError(

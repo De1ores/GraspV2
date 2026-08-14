@@ -184,6 +184,7 @@ class McCustomGraspClient(Node):
         action: str | float,
         *,
         label: str | None = None,
+        duration_s: float | None = None,
     ) -> bool:
         """Call the repository SDK's publish_command; never raise to MC."""
 
@@ -200,10 +201,25 @@ class McCustomGraspClient(Node):
                 raise ValueError("OmniPicker position must be within [0, 1]")
             description = label or f"position={target_position:.3f}"
         try:
-            self.omnipicker_node.publish_command("right", target_position)
+            if duration_s is None:
+                self.omnipicker_node.publish_command("right", target_position)
+            else:
+                duration = float(duration_s)
+                if duration <= 0.0:
+                    raise ValueError("OmniPicker command duration must be positive")
+                self.omnipicker_node.publish_command(
+                    "right",
+                    target_position,
+                    duration_seconds=duration,
+                )
             self.get_logger().info(
                 "Repository omnipicker_hand_student SDK completed "
                 f"{description} right"
+                + (
+                    ""
+                    if duration_s is None
+                    else f" over {float(duration_s):.3f} s"
+                )
             )
             return True
         except (Exception, SystemExit) as error:
@@ -688,14 +704,26 @@ class McCustomGraspClient(Node):
             "initial_gripper_position",
             None,
         )
+        initial_duration = getattr(
+            getattr(self, "args", None),
+            "initial_gripper_duration",
+            None,
+        )
         if initial_position is None:
             # Backward compatibility for callers constructed before staged
             # grasp animations existed.
-            initial_succeeded = self._run_gripper_sdk_best_effort("open")
+            if initial_duration is None:
+                initial_succeeded = self._run_gripper_sdk_best_effort("open")
+            else:
+                initial_succeeded = self._run_gripper_sdk_best_effort(
+                    "open",
+                    duration_s=initial_duration,
+                )
         else:
             initial_succeeded = self._run_gripper_sdk_best_effort(
                 initial_position,
                 label="initial-hand-state",
+                duration_s=initial_duration,
             )
         if (
             not initial_succeeded
@@ -794,6 +822,12 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="right OmniPicker target established before animation playback",
+    )
+    parser.add_argument(
+        "--initial-gripper-duration",
+        type=float,
+        default=3.0,
+        help="seconds to publish the initial hand target before playback",
     )
     parser.add_argument(
         "--gripper-event",
@@ -902,6 +936,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--area must be non-negative")
     if not 0.0 <= args.initial_gripper_position <= 1.0:
         parser.error("--initial-gripper-position must be within [0, 1]")
+    if args.initial_gripper_duration <= 0.0:
+        parser.error("--initial-gripper-duration must be positive")
     if args.no_gripper and args.require_gripper_sdk:
         parser.error("--no-gripper conflicts with --require-gripper-sdk")
     if any(
@@ -929,7 +965,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.gripper_events:
             print(
                 "OmniPicker staged sequence: initial="
-                f"{args.initial_gripper_position:.3f}; "
+                f"{args.initial_gripper_position:.3f} for "
+                f"{args.initial_gripper_duration:.3f}s before playback; "
                 + ", ".join(
                     f"{event.label}@{event.time_s:.3f}s="
                     f"{event.position:.3f}"
@@ -939,7 +976,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             print(
                 "OmniPicker: repository omnipicker_hand_student SDK opens "
-                "before playback, then closes at "
+                f"for {args.initial_gripper_duration:.3f}s before playback, "
+                "then closes at "
                 f"target hold t={info.grasp_close_time_s:.3f}s "
                 f"(detected hold={info.grasp_hold_duration_s:.3f}s)."
             )

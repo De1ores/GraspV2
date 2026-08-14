@@ -302,6 +302,12 @@ def test_demo_scene_completes_approach_lift_and_return_planning() -> None:
         - approach.obstacle.target_object.object_center_m[2]
     ) == pytest.approx(0.01)
     assert sequence.preopen_position == pytest.approx(1.0)
+    assert sequence.open_duration_s == pytest.approx(3.0)
+    assert approach.report["gripper_fully_open_before_arm_motion"] is True
+    assert sequence.report["gripper_fully_open_before_arm_motion"] is True
+    assert sequence.report["phases"][0] == (
+        "fully_open_gripper_before_arm_motion"
+    )
     assert sequence.report["lifted_hold_duration_s"] == pytest.approx(2.5)
     assert sequence.report["controlled_lower_duration_s"] == pytest.approx(
         sequence.lift.duration_s

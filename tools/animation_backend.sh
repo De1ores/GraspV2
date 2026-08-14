@@ -13,6 +13,7 @@ robot_animation="/tmp/graspv2_mc_animation.csv"
 runtime_profile="$($repo_dir/tools/detect_runtime_profile.sh)"
 assume_yes=false
 initial_gripper_position=""
+initial_gripper_duration=""
 gripper_events=()
 
 while (($#)); do
@@ -29,6 +30,11 @@ while (($#)); do
     --initial-gripper-position)
       [[ $# -ge 2 ]] || { echo "--initial-gripper-position requires a value" >&2; exit 2; }
       initial_gripper_position="$2"
+      shift 2
+      ;;
+    --initial-gripper-duration)
+      [[ $# -ge 2 ]] || { echo "--initial-gripper-duration requires a value" >&2; exit 2; }
+      initial_gripper_duration="$2"
       shift 2
       ;;
     --gripper-event)
@@ -114,6 +120,9 @@ if [[ "$runtime_profile" == "competition" ]]; then
 fi
 if [[ -n "$initial_gripper_position" ]]; then
   gripper_args+=(--initial-gripper-position "$initial_gripper_position")
+fi
+if [[ -n "$initial_gripper_duration" ]]; then
+  gripper_args+=(--initial-gripper-duration "$initial_gripper_duration")
 fi
 for event in "${gripper_events[@]}"; do
   gripper_args+=(--gripper-event "$event")

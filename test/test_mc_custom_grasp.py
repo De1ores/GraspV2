@@ -29,6 +29,7 @@ def test_ani_path_request_defaults_to_right_arm_without_interrupt() -> None:
     assert not args.no_gripper
     assert not args.require_gripper_sdk
     assert args.initial_gripper_position == 1.0
+    assert args.initial_gripper_duration == pytest.approx(3.0)
     assert args.gripper_events == []
 
 
@@ -158,6 +159,34 @@ def test_repository_gripper_sdk_failure_is_warning_only() -> None:
     assert warnings == [
         "student SDK close right failed: control cable unavailable"
     ]
+
+
+def test_repository_gripper_sdk_uses_three_second_premotion_open() -> None:
+    commands = []
+
+    class RecordingStudentNode:
+        def publish_command(
+            self,
+            hand,
+            target_position,
+            *,
+            duration_seconds,
+        ):
+            commands.append((hand, target_position, duration_seconds))
+
+    client = SimpleNamespace(
+        omnipicker_node=RecordingStudentNode(),
+        _warn_gripper=lambda _message: None,
+        get_logger=lambda: SimpleNamespace(info=lambda _message: None),
+    )
+
+    assert McCustomGraspClient._run_gripper_sdk_best_effort(
+        client,
+        1.0,
+        label="initial-hand-state",
+        duration_s=3.0,
+    )
+    assert commands == [("right", 1.0, 3.0)]
 
 
 def test_animation_continues_when_repository_gripper_sdk_fails() -> None:

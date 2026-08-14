@@ -127,9 +127,10 @@ topic 在超时前无法同步时，自动改用同一相机的本地 Orbbec SDK
 ./run.sh --vision-result output/result.json --headless
 ```
 
-规划会生成接近、抬升和受控放回/返回三段轨迹。接近段不再使用随机 RRT 绕行：机械臂先
-在机器人一侧向右外移 6 cm 并抬高到确定性安全预备点，再在高位移到物体顶部上方 3 cm。
-夹爪完全打开后下降到物体中值高度上方 1 cm，并按视觉半径闭合；抬升、保持约 2.5 秒后
+规划会生成接近、抬升和受控放回/返回三段轨迹。任何机械臂移动指令发出前，右侧夹爪先通过
+SDK 以 `position=1.0` 持续 3 秒完全打开。接近段不再使用随机 RRT 绕行：机械臂随后在机器人
+一侧向右外移 6 cm 并抬高到确定性安全预备点，再在高位移到物体顶部上方 3 cm。夹爪保持
+全开下降到物体中值高度上方 1 cm，并按视觉半径闭合；抬升、保持约 2.5 秒后
 夹紧放回，再退回 SD 初始位。MuJoCo 碰撞/边检查仍作为安全门。右侧 OmniPicker 始终使用
 实测 TCP；相机全局偏移不能代替 TCP offset。详细标定方法见
 [`docs/tool_offset_calibration_zh.md`](docs/tool_offset_calibration_zh.md)。
@@ -149,7 +150,7 @@ deterministic seed，选择位置误差最小且通过 MuJoCo 状态碰撞和上
 ```
 
 animation CSV 保持 20 列手臂动作并内置返回默认位路径；夹爪明确调用仓库内
-`omnipicker_hand_student.py` SDK：播放前执行 `open right`，到达目标保持段时并行执行
+`omnipicker_hand_student.py` SDK：提交任何 animation 移动请求前持续 3 秒执行 `open right`，到达目标保持段时并行执行
 `close right`。新生成动作会在目标位保持约 2 秒供夹爪闭合。比赛 profile 强制 SDK 加载和
 初始命令成功，阶段命令失败会在 MC 安全返回后报告失败；测试 profile 只输出 warning，便于
 未接控制线时验证手臂 animation。测试模式可用 `--no-gripper` 显式只播放手臂。真机播放仍
@@ -176,8 +177,8 @@ ros2 run graspv2 x2_aimdk_hardware trajectory \
 ```
 
 使用 `--upper-body-fallback none` 可关闭回退。完整抓取会预先生成与仿真物理阶段一致的
-animation：安全预备/下降、全开、按目标半径闭合、抬升、悬停、受控放下、松开、张开撤离、
-空夹爪闭合和回默认位。competition 先使用比赛机本机 upper-body，任一运动前接口/模式/
+animation：移动前全开 3 秒、安全预备/下降、按目标半径闭合、抬升、悬停、受控放下、松开、
+张开撤离、空夹爪闭合和回默认位。competition 先使用比赛机本机 upper-body，任一运动前接口/模式/
 控制权/起点/初始夹爪检查失败时回退到本机 animation；输入源 HOLD 帧不阻止回退，计划轨迹
 启动后才禁止重放。比赛机主通道夹爪动作直接调用 `omnipicker_hand_student.py`，SDK 运行时
 持续保持上肢目标。test 保留相同的安全边界。MC 单条 animation
@@ -192,7 +193,7 @@ animation：安全预备/下降、全开、按目标半径闭合、抬升、悬�
 `GRASPV2_ROBOT_PASSWORD` 覆盖测试参数，也可用 `GRASPV2_RUNTIME_PROFILE` 显式固定环境。
 一次执行不会从比赛机跨环境切换到测试机。
 
-- 计划 upper-body 轨迹已经启动（输入源激活 HOLD 帧和初始空夹爪命令不算）；
+- 计划 upper-body 轨迹已经启动（输入源激活 HOLD 帧和移动前全开夹爪命令不算）；
 - 需要低层 `hal-joint` 控制；
 - 运动开始后的跟踪、视觉或夹爪状态机失败。
 

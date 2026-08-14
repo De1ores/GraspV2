@@ -386,7 +386,7 @@ def test_visual_grasp_sequence_orders_hand_vision_lift_and_recovery() -> None:
         visual_radius_m=0.045,
         preopen_position=1.0,
         grip_position=0.72,
-        open_duration_s=0.5,
+        open_duration_s=3.0,
         close_duration_s=0.8,
         grasp_settle_duration_s=0.3,
         lifted_hold_duration_s=2.5,
@@ -404,8 +404,8 @@ def test_visual_grasp_sequence_orders_hand_vision_lift_and_recovery() -> None:
     node._validate_upper_body_start = lambda *_args: None
     node._require_stable_mode = lambda: events.append("stable")
     node.configure_input_source = lambda: events.append("configure-source")
-    node.execute_omnipicker = lambda side, position: events.append(
-        f"preopen:{side}:{position:.1f}"
+    node.execute_omnipicker = lambda side, position, **kwargs: events.append(
+        f"preopen:{side}:{position:.1f}:{kwargs['duration_s']:.1f}"
     )
     node._enter_split_mode = lambda: events.append("enter-split")
     node._activate_input_source = (
@@ -461,12 +461,11 @@ def test_visual_grasp_sequence_orders_hand_vision_lift_and_recovery() -> None:
         "consumer:hand",
         "stable",
         "configure-source",
+        "preopen:right:1.0:3.0",
         "enter-split",
         "consumer:upper-body",
         "activate-source",
-        "preopen:right:0.0",
         "trajectory:move-above-object",
-        "hand:right:1.0",
         "trajectory:vertical-descent",
         "hand:right:0.7",
         "hold:grasp-settle:0.3",

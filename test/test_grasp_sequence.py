@@ -183,12 +183,14 @@ def test_grasp_plan_metadata_and_joint_continuity(tmp_path: Path) -> None:
                     "gripper_center_world_m": [0.4, -0.2, 0.8],
                     "target_world_m": [0.4, -0.2, 0.8],
                     "vertical_descent_start_time_s": 1.0,
+                    "gripper_fully_open_before_arm_motion": True,
                     "simulated_grasp_sequence": {
                         "visual_radius_m": 0.045,
                         "preopen_position": 1.0,
                         "grip_position": 0.72,
                         "vertical_descent_start_time_s": 1.0,
-                        "open_duration_s": 0.5,
+                        "open_duration_s": 3.0,
+                        "gripper_fully_open_before_arm_motion": True,
                         "close_duration_s": 0.8,
                         "grasp_settle_duration_s": 0.3,
                         "lifted_hold_duration_s": 2.5,
@@ -246,6 +248,7 @@ def test_grasp_plan_metadata_and_joint_continuity(tmp_path: Path) -> None:
     metadata = load_grasp_plan_metadata(approach_path, lift_path, return_path)
     assert metadata.lift_duration_s == pytest.approx(2.0)
     assert metadata.preopen_position == pytest.approx(1.0)
+    assert metadata.open_duration_s == pytest.approx(3.0)
     assert metadata.pregrasp_duration_s == pytest.approx(1.0)
     assert metadata.object_center_world_m == pytest.approx((0.4, -0.2, 0.795))
     assert metadata.gripper_center_world_m == pytest.approx((0.4, -0.2, 0.8))

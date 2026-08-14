@@ -106,9 +106,9 @@ animation, base, hal-joint, omnipicker
 
 程序在连接机器人前把同一条官方 IK + MuJoCo 验证轨迹转换为 MC animation。CSV 保持
 20 列手臂格式，播放器调用仓库内 `omnipicker_hand_student.py` SDK。完整抓取 animation
-包含安全预备、全开、下降、按半径闭合、抬升/悬停、受控放下、松开、张开撤离、空夹爪
+包含移动前全开 3 秒、安全预备、下降、按半径闭合、抬升/悬停、受控放下、松开、张开撤离、空夹爪
 闭合和回默认位；不包含可阻塞播放的中间视觉门。程序显式记录计划轨迹是否开始；输入源激活
-HOLD 帧及开始运动前的空夹爪闭合仍允许关闭分控节点并启动 animation。
+HOLD 帧及开始运动前持续 3 秒的全开夹爪命令仍允许关闭分控节点并启动 animation。
 
 `GRASPV2_RUNTIME_PROFILE=competition` 时，完整抓取先尝试比赛机本机 upper-body；任一运动前
 能力、服务、模式、输入源、订阅者、起点或初始夹爪检查失败时进入本机 animation。`test`

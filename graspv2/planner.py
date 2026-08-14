@@ -38,7 +38,7 @@ MAXIMUM_GRIPPER_AXIS_ERROR_DEG = 1.0
 # joint-limit boundary.  Such a point is accepted only after the same MuJoCo
 # state/edge gates as an exact solution, and the closest valid seed wins.
 MAXIMUM_NEAREST_IK_POSITION_ERROR_M = 0.05
-GRIPPER_PREOPEN_DURATION_S = 2.0
+GRIPPER_PREOPEN_DURATION_S = 3.0
 GRIPPER_CLOSE_DURATION_S = 2.0
 GRASP_SETTLE_DURATION_S = 0.3
 LIFTED_HOLD_DURATION_S = 2.5
@@ -175,9 +175,9 @@ def gripper_positions_for_visual_radius(
     if not math.isfinite(maximum) or maximum <= 0.0:
         raise ValueError("maximum_diameter_m must be positive and finite")
     diameter = 2.0 * radius
-    # The approach waypoint is deliberately reached with the hand closed.  At
-    # that collision-checked waypoint the hand then opens completely before
-    # any vertical descent.  Only the closing position is radius-dependent.
+    # The hand opens completely before the first arm-motion command and stays
+    # open throughout safe staging, transfer and descent.  Only the closing
+    # position is radius-dependent.
     preopen = 1.0
     grip = min(1.0, max(0.0, (diameter - grip_compression_m) / maximum))
     return preopen, min(grip, preopen)
@@ -709,6 +709,9 @@ def plan_trajectory(
         obstacle,
         visual_urdf_path=visual_urdf_path,
     )
+    # Live execution opens the OmniPicker before issuing any arm-motion
+    # command.  Keep every IK collision/edge gate in that same physical state.
+    simulation.set_gripper_position(1.0)
     checker = CollisionChecker(
         simulation,
         side,
@@ -1049,6 +1052,8 @@ def plan_trajectory(
         "nearest_ik_fallback_maximum_error_m": nearest_ik_maximum_error_m,
         "nearest_ik_fallbacks": nearest_ik_fallbacks,
         "planning_strategy": "robot_side_safe_staging_then_cartesian_grasp",
+        "approach_gripper_position": 1.0,
+        "gripper_fully_open_before_arm_motion": True,
         "safe_staging_world_m": [float(value) for value in safe_staging],
         "safe_staging_lift_m": safe_lift_distance_m,
         "safe_staging_outward_offset_m": SAFE_STAGING_OUTWARD_OFFSET_M,
@@ -1762,9 +1767,15 @@ def plan_simulated_grasp_sequence(
 
     descent_frame = int(approach.report["vertical_descent_start_frame"])
     for gripper in np.linspace(0.0, preopen, 11):
-        validate_state(approach.positions[descent_frame], float(gripper), "open")
+        validate_state(
+            approach.positions[0],
+            float(gripper),
+            "open_before_arm_motion",
+        )
+    for joints in approach.positions[: descent_frame + 1]:
+        validate_state(joints, preopen, "open_move_above_object")
     for joints in approach.positions[descent_frame:]:
-        validate_state(joints, preopen, "vertical_descent")
+        validate_state(joints, preopen, "open_vertical_descent")
     for gripper in np.linspace(preopen, grip, 11):
         validate_state(approach.positions[-1], float(gripper), "radius_close")
     for joints in lift.positions:
@@ -1811,6 +1822,7 @@ def plan_simulated_grasp_sequence(
         "omnipicker_maximum_diameter_m": OMNIPICKER_MAX_GRASP_DIAMETER_M,
         "preopen_position": preopen,
         "grip_position": grip,
+        "gripper_fully_open_before_arm_motion": True,
         "vertical_descent_start_time_s": float(
             approach.report["vertical_descent_start_time_s"]
         ),
@@ -1853,8 +1865,8 @@ def plan_simulated_grasp_sequence(
             9,
         ),
         "phases": [
+            "fully_open_gripper_before_arm_motion",
             "move_above_object",
-            "fully_open_gripper",
             "vertical_descent",
             "close_to_visual_radius",
             "grasp_settle",
@@ -1993,10 +2005,10 @@ def replay_grasp_sequence(sequence: SimulatedGraspSequence) -> None:
         - open_retreat_duration
     )
     phase_ends: list[tuple[str, float]] = []
-    cursor = descent_start
+    cursor = sequence.open_duration_s
+    phase_ends.append(("fully_open_gripper_before_arm_motion", cursor))
+    cursor += descent_start
     phase_ends.append(("move_above_object", cursor))
-    cursor += sequence.open_duration_s
-    phase_ends.append(("fully_open_gripper", cursor))
     cursor += descent_duration
     phase_ends.append(("vertical_descent", cursor))
     cursor += sequence.close_duration_s
@@ -2057,11 +2069,12 @@ def replay_grasp_sequence(sequence: SimulatedGraspSequence) -> None:
             gripper = 0.0
             object_center = initial_center
             attached = False
-            if phase_name == "move_above_object":
-                arm = _interpolate_replay_position(approach, elapsed)
-            elif phase_name == "fully_open_gripper":
-                arm = _interpolate_replay_position(approach, descent_start)
+            if phase_name == "fully_open_gripper_before_arm_motion":
+                arm = approach.positions[0]
                 gripper = blend * sequence.preopen_position
+            elif phase_name == "move_above_object":
+                arm = _interpolate_replay_position(approach, local_time)
+                gripper = sequence.preopen_position
             elif phase_name == "vertical_descent":
                 arm = _interpolate_replay_position(
                     approach, descent_start + local_time

@@ -58,6 +58,7 @@ class McAnimation:
     maximum_arm_velocity: float
     return_path_enabled: bool = True
     initial_gripper_position: float = 1.0
+    initial_gripper_duration_s: float = 3.0
     gripper_events: tuple["McGripperEvent", ...] = ()
 
     @property
@@ -452,10 +453,6 @@ def build_mc_grasp_animation(
 
     append_bridge()
     append_motion(approach, 0.0, metadata.pregrasp_duration_s)
-    pregrasp_arm = approach.apply(default_arm, metadata.pregrasp_duration_s)
-    add_gripper_event(metadata.preopen_position, "fully-open-at-pregrasp")
-    append_hold(metadata.open_duration_s, pregrasp_arm)
-
     append_motion(
         approach,
         metadata.pregrasp_duration_s,
@@ -502,7 +499,8 @@ def build_mc_grasp_animation(
         duration_s=elapsed,
         bridge_duration_s=bridge_duration,
         maximum_arm_velocity=maximum_velocity,
-        initial_gripper_position=0.0,
+        initial_gripper_position=metadata.preopen_position,
+        initial_gripper_duration_s=metadata.open_duration_s,
         gripper_events=tuple(events),
     )
 

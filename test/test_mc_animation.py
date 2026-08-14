@@ -130,19 +130,19 @@ def test_complete_grasp_animation_matches_all_simulated_phases(
     )
 
     assert animation.bridge_duration_s == 0.0
-    assert animation.duration_s == pytest.approx(0.39)
-    assert animation.initial_gripper_position == 0.0
+    assert animation.duration_s == pytest.approx(0.37)
+    assert animation.initial_gripper_position == 1.0
+    assert animation.initial_gripper_duration_s == pytest.approx(0.02)
     assert [event.label for event in animation.gripper_events] == [
-        "fully-open-at-pregrasp",
         "close-to-visual-radius",
         "fully-open-placed-release",
         "close-empty-at-pregrasp",
     ]
     assert [event.time_s for event in animation.gripper_events] == pytest.approx(
-        [0.04, 0.12, 0.27, 0.34]
+        [0.10, 0.25, 0.32]
     )
     assert [event.position for event in animation.gripper_events] == pytest.approx(
-        [1.0, 0.55, 1.0, 0.0]
+        [0.55, 1.0, 0.0]
     )
     assert tuple(animation.rows[-1][4:18]) == pytest.approx(
         DEFAULT_ARM_POSITION

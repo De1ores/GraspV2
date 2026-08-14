@@ -385,8 +385,9 @@ def _plan(args: argparse.Namespace, profile: RobotProfile):
             f"opening_table_tilt={opening_tilt_text}"
         )
         print(
-            "Phases: robot-side raised safe staging -> 3cm above object top -> "
-            "fully open -> vertical descend -> radius close -> grasp -> lift -> "
+            f"Phases: fully open for {sequence.open_duration_s:.1f}s before "
+            "arm motion -> robot-side raised safe staging -> 3cm above object "
+            "top -> vertical descend -> radius close -> grasp -> lift -> "
             "hold -> controlled lower -> release -> open-hand retreat -> "
             "close at pregrasp -> default"
         )

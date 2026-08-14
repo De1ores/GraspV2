@@ -1162,20 +1162,33 @@ def create_aimdk_hardware_node(
                 f"{side} target={position:.3f}, duration={duration:.3f} s"
             )
 
-        def execute_omnipicker(self, side: str, position: float) -> None:
+        def execute_omnipicker(
+            self,
+            side: str,
+            position: float,
+            *,
+            duration_s: float | None = None,
+        ) -> None:
+            duration = (
+                config.omnipicker.publish_duration_s
+                if duration_s is None
+                else float(duration_s)
+            )
+            if duration <= 0.0:
+                raise ValueError("OmniPicker command duration must be positive")
             if self.runtime_profile == "competition":
                 self._check_omnipicker_feedback_if_available(side)
                 self._competition_omnipicker_command(
                     side,
                     position,
-                    config.omnipicker.publish_duration_s,
+                    duration,
                 )
                 self._check_omnipicker_feedback_if_available(side)
                 return
             self._wait_for_command_consumer("hand")
             self._check_omnipicker_feedback_if_available(side)
             period = 1.0 / config.omnipicker.publish_rate_hz
-            deadline = time.monotonic() + config.omnipicker.publish_duration_s
+            deadline = time.monotonic() + duration
             frames = 0
             while time.monotonic() < deadline:
                 started = time.monotonic()
@@ -1573,27 +1586,22 @@ def create_aimdk_hardware_node(
             grasp_frame: UpperBodyFrame | None = None
             lift_frame: UpperBodyFrame | None = None
             try:
-                # Prove that the legacy split action exists before starting
-                # the planned arm path. Activation HOLD frames and the initial
-                # empty-gripper command still leave animation fallback safe.
-                if self.runtime_profile == "competition":
-                    # Close the empty gripper before MC source activation so
-                    # the standalone SDK cannot starve upper-body keepalives.
-                    self.execute_omnipicker(
-                        metadata.side,
-                        config.omnipicker.closed_position,
-                    )
+                # Fully open through the official hand SDK before entering
+                # split mode or publishing any planned arm-motion command.
+                # A failure here is still eligible for the atomic animation
+                # fallback because no planned arm motion has started.
+                self.execute_omnipicker(
+                    metadata.side,
+                    metadata.preopen_position,
+                    duration_s=metadata.open_duration_s,
+                )
+                base = self._assert_arm_health(
+                    profile,
+                    require_stationary=True,
+                )
                 self._enter_split_mode()
                 self._wait_for_command_consumer("upper-body")
                 self._activate_input_source(profile, base, head)
-                # MuJoCo starts with an empty closed gripper while moving above
-                # the target. Establish the same state only after MC ownership
-                # has been accepted.
-                if self.runtime_profile != "competition":
-                    self.execute_omnipicker(
-                        metadata.side,
-                        config.omnipicker.closed_position,
-                    )
                 base = self._assert_arm_health(
                     profile,
                     require_stationary=True,
@@ -1604,13 +1612,6 @@ def create_aimdk_hardware_node(
                     base,
                     head,
                     label="move-above-object",
-                )
-                self._command_omnipicker_while_holding(
-                    profile,
-                    pregrasp_frame,
-                    metadata.side,
-                    metadata.preopen_position,
-                    duration_s=metadata.open_duration_s,
                 )
                 grasp_frame = self._run_upper_body_trajectory(
                     profile,
@@ -2209,6 +2210,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         position: float | None = None
         fallback_animation: Path | None = None
         fallback_initial_gripper_position: float | None = None
+        fallback_initial_gripper_duration_s: float | None = None
         fallback_gripper_events: tuple[McGripperEvent, ...] = ()
         if args.operation in {"preflight", "trajectory", "grasp"}:
             profile = get_robot_profile(args.robot)
@@ -2337,6 +2339,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 fallback_initial_gripper_position = (
                     animation.initial_gripper_position
                 )
+                fallback_initial_gripper_duration_s = (
+                    animation.initial_gripper_duration_s
+                )
                 fallback_gripper_events = animation.gripper_events
                 fallback_animation = write_mc_animation_csv(
                     animation,
@@ -2371,8 +2376,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"grip={grasp_metadata.grip_position:.3f}"
                 )
                 print(
-                    "Sequence: closed robot-side safe staging -> high transfer "
-                    "-> fully open -> vertical descent -> radius close -> "
+                    "Sequence: fully open for "
+                    f"{grasp_metadata.open_duration_s:.1f}s before arm motion "
+                    "-> robot-side safe staging -> high transfer -> vertical "
+                    "descent -> radius close -> "
                     "visual gate -> lift -> visual no-drop gate -> hold -> "
                     "controlled lower -> placed release -> open retreat -> "
                     "close-empty -> verified return"
@@ -2386,7 +2393,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         f"{len(fallback_gripper_events)} synchronized hand "
                         "events). It is eligible only before planned arm "
                         "trajectory motion starts; setup HOLD frames and the "
-                        "initial empty-gripper command remain recoverable. Its "
+                        "pre-motion fully-open command remain recoverable. Its "
                         "physical phases match the "
                         "verified simulation sequence."
                     )
@@ -2528,7 +2535,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(
                 "The competition local upper-body interface failed before "
                 "planned trajectory motion started; starting the complete local MC "
-                "animation fallback: safe staging, open, descent, radius "
+                "animation fallback: pre-motion open, safe staging, descent, radius "
                 "close, lift, hold, controlled lower, placed release, open "
                 f"retreat, empty close and verified return ({fallback_reason}).",
                 file=sys.stderr,
@@ -2538,7 +2545,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "Upper-body control aborted before planned trajectory motion "
                 "started; "
                 "starting the complete MC grasp animation fallback. The "
-                "fallback performs safe staging, open, descent, radius close, "
+                "fallback opens before playback, then performs safe staging, "
+                "descent, radius close, "
                 "lift, hold, controlled lower, placed release, open retreat, "
                 f"empty close and verified return ({fallback_reason}).",
                 file=sys.stderr,
@@ -2554,6 +2562,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 [
                     "--initial-gripper-position",
                     f"{fallback_initial_gripper_position:.9f}",
+                ]
+            )
+        if fallback_initial_gripper_duration_s is not None:
+            backend_command.extend(
+                [
+                    "--initial-gripper-duration",
+                    f"{fallback_initial_gripper_duration_s:.9f}",
                 ]
             )
         for event in fallback_gripper_events:

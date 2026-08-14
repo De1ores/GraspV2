@@ -427,7 +427,7 @@ source tools/setup_x2_mc_env.sh
 ```
 
 20 列 CSV 本身不包含手部列，内部包含返回默认位路径；播放器明确调用仓库内的
-`omnipicker_hand_student.py` SDK，在动作前执行 `open right`、目标保持段开始时并行执行
+`omnipicker_hand_student.py` SDK，在任何机械臂动作请求前持续 3 秒执行 `open right`、目标保持段开始时并行执行
 `close right`。新生成动作默认在目标位保持约 2 秒。SDK、DDS、控制器或控制线失败只记录
 warning，不会中断手臂播放和反向返回；必要时可加 `--no-gripper` 只播放手臂。真机播放前仍
 会检查 `STAND_DEFAULT/100`、14 轴健康/静止、默认起点、速度、文件校验和和最终返回。
@@ -453,7 +453,7 @@ ros2 run graspv2 x2_aimdk_hardware trajectory \
 - 计划 upper-body 轨迹开始后禁止跨控制器重放；输入源激活 HOLD 帧不算计划运动；
 - animation 自身前检不通过时拒绝运动；
 - 不会自动选择低层 `hal-joint`；
-- 完整视觉抓取只在计划轨迹开始前回退，初始空夹爪命令不阻止回退。回退 animation 包含安全预备/下降、全开、
+- 完整视觉抓取只在计划轨迹开始前回退，移动前全开夹爪命令不阻止回退。回退 animation 包含移动前全开 3 秒、安全预备/下降、
   按目标半径闭合、抬升、悬停、受控放下、松开、张开撤离、空夹爪闭合和回默认位；
   单条 MC animation 无法等待视觉结果，日志会明确提示该路径没有中间视觉门。
 

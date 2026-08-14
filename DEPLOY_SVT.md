@@ -82,12 +82,12 @@ export GRASPV2_ROBOT_PASSWORD=1
 `/home/agi/aimdk/install/setup.bash`，不会访问上述测试地址。
 
 执行命令会预先生成 MC animation 安全回退。只要计划轨迹尚未开始，旧 upper-body 接管失败
-就会自动切换；输入源激活 HOLD 帧和初始空夹爪命令不阻止回退。已经开始运动后仍立即停止，
+就会自动切换；输入源激活 HOLD 帧和移动前全开夹爪命令不阻止回退。已经开始运动后仍立即停止，
 不会跨控制器重放。回退的
-机械臂和夹爪阶段与仿真一致，包括安全预备、下降、按半径闭合、抬升/悬停、受控放下、
+机械臂和夹爪阶段与仿真一致，包括移动前全开 3 秒、安全预备、下降、按半径闭合、抬升/悬停、受控放下、
 松开、撤离和回默认位。单条 MC animation 不能等待中间视觉判定，终端会明确提示
 `MC animation fallback`。
 
 单独执行 `./run.sh --mode animation --execute` 时，程序会调用仓库内
-`omnipicker_hand_student.py` SDK，在播放前执行 `open right`、到达目标保持段时并行执行
+`omnipicker_hand_student.py` SDK，在任何 animation 移动请求前持续 3 秒执行 `open right`、到达目标保持段时并行执行
 `close right`。测试机未接夹爪控制线时只提示 warning，手臂 animation 和返回动作仍继续。
